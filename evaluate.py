@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """Evaluate a trained RL agent on Open Auto Battler.
 
 Runs the model for N games in a self-play lobby and reports win/loss

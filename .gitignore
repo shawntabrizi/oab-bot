@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Rust / PyO3 build
+pylib/target/
+*.so
+*.dylib
+
+# Training artifacts
+models/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp

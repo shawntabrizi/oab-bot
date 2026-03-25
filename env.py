@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Gymnasium environment for Open Auto Battler with self-play support.
 
-Wraps the OAB game server's two-phase API (POST /shop + POST /battle)
-into a standard Gymnasium interface with action masking for MaskablePPO.
+Uses the native PyO3 bindings (oab_py) for direct game engine access,
+bypassing the HTTP server entirely.
 
 Each gym step is one action within a shop turn. The 'EndTurn' action
 submits shop actions, picks an opponent from the shared board pool,
@@ -12,13 +12,13 @@ runs the battle, and returns the result.
 import json
 import random
 import threading
-import urllib.request
-import urllib.error
 from itertools import combinations
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+
+import oab_py
 
 # ── Game Constants ──
 
@@ -104,94 +104,33 @@ class BoardPool:
             return len(self._boards)
 
 
-# ── HTTP Client ──
-
-class OABClient:
-    """HTTP client for the OAB game server (two-phase API)."""
-
-    def __init__(self, base_url="http://localhost:3000"):
-        self.base_url = base_url
-
-    def _post(self, path, data=None):
-        body = json.dumps(data).encode() if data else b""
-        req = urllib.request.Request(
-            self.base_url + path,
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                return json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            return json.loads(e.read().decode())
-
-    def _get(self, path):
-        req = urllib.request.Request(self.base_url + path)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode())
-
-    def reset(self, agent_id="default", seed=None, set_id=None):
-        body = {"agent_id": agent_id}
-        if seed is not None:
-            body["seed"] = seed
-        if set_id is not None:
-            body["set_id"] = set_id
-        return self._post("/reset", body)
-
-    def shop(self, agent_id, actions):
-        return self._post("/shop", {"agent_id": agent_id, "actions": actions})
-
-    def battle(self, agent_id, opponent):
-        return self._post("/battle", {"agent_id": agent_id, "opponent": opponent})
-
-    def state(self, agent_id="default"):
-        return self._get(f"/state?agent_id={agent_id}")
-
-    def cards(self):
-        return self._get("/cards")
-
-    def sets(self):
-        return self._get("/sets")
-
-
 # ── Gymnasium Environment ──
 
 class OABEnv(gym.Env):
     """Open Auto Battler environment with self-play.
 
+    Uses native PyO3 bindings — no HTTP server needed.
+
     Observation: Box(91,) normalized to [0, 1]
     Action: Discrete(66) with action masking
     Reward: +1 win, -1 loss, 0 draw (per battle round)
-
-    On EndTurn:
-      1. POST /shop — submit shop actions
-      2. Post own board to the shared BoardPool
-      3. Sample opponent from the BoardPool
-      4. POST /battle — run battle, get reward
     """
 
     metadata = {"render_modes": []}
 
-    def __init__(
-        self,
-        server_url="http://localhost:3000",
-        set_id=0,
-        agent_id="default",
-        board_pool=None,
-    ):
+    def __init__(self, set_id=0, board_pool=None):
         super().__init__()
-        self.client = OABClient(server_url)
         self.set_id = set_id
-        self.agent_id = agent_id
-        self.board_pool = board_pool  # None = play against empty board
+        self.board_pool = board_pool
 
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(NUM_ACTIONS)
 
-        # Internal state
-        self._server_state = None
+        # Game session (native Rust)
+        self._session = None
+        self._state = None
         self._hand = [None] * HAND_SIZE
         self._board = [None] * BOARD_SIZE
         self._mana = 0
@@ -200,10 +139,9 @@ class OABEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        game_seed = int(self.np_random.integers(0, 2**32)) if seed is not None else None
-        self._server_state = self.client.reset(
-            agent_id=self.agent_id, seed=game_seed, set_id=self.set_id
-        )
+        game_seed = int(self.np_random.integers(0, 2**32))
+        self._session = oab_py.GameSession(game_seed, self.set_id)
+        self._state = json.loads(self._session.get_state())
         self._sync_local_state()
         self._pending_actions = []
         return self._encode_obs(), self._make_info()
@@ -219,48 +157,47 @@ class OABEnv(gym.Env):
             return self._encode_obs(), 0.0, False, False, self._make_info()
 
     def action_masks(self):
-        """Boolean mask of valid actions for MaskablePPO."""
         mask = np.zeros(NUM_ACTIONS, dtype=bool)
         for i, (action_type, params) in enumerate(ACTION_TABLE):
             mask[i] = self._is_valid(action_type, params)
         return mask
 
     def get_board_as_opponent(self):
-        """Return current board in OpponentUnit format for other agents."""
+        """Return current board in OpponentUnit format."""
         opponent = []
         for slot, unit in enumerate(self._board):
             if unit is not None:
-                entry = {"card_id": _extract_card_id(unit), "slot": slot}
-                opponent.append(entry)
+                opponent.append({"card_id": _extract_card_id(unit), "slot": slot})
         return opponent
 
     # ── Turn Submission ──
 
     def _do_end_turn(self):
-        """Submit shop actions, sample opponent, run battle."""
-        # 1. Submit shop actions
+        # Build actions JSON
         server_actions = []
         for action_type, params in self._pending_actions:
             action = {"type": action_type}
             action.update(params)
             server_actions.append(action)
 
-        shop_result = self.client.shop(self.agent_id, server_actions)
+        actions_json = json.dumps(server_actions)
 
-        if "error" in shop_result:
+        # Shop phase
+        try:
+            shop_result = json.loads(self._session.shop(actions_json))
+        except Exception:
             # Fallback: empty shop
-            shop_result = self.client.shop(self.agent_id, [])
-            if "error" in shop_result:
+            try:
+                shop_result = json.loads(self._session.shop("[]"))
+            except Exception as e:
                 return self._encode_obs(), -1.0, True, False, {
-                    "error": shop_result["error"],
-                    **self._make_info(),
+                    "error": str(e), **self._make_info()
                 }
 
-        # Update state from shop result
-        self._server_state = shop_result
+        self._state = shop_result
         self._sync_local_state()
 
-        # 2. Post own board to pool and sample opponent
+        # Post board to pool and sample opponent
         my_board = self.get_board_as_opponent()
         if self.board_pool is not None:
             self.board_pool.add(my_board)
@@ -268,19 +205,20 @@ class OABEnv(gym.Env):
         else:
             opponent = []
 
-        # 3. Run battle
-        result = self.client.battle(self.agent_id, opponent)
+        opponent_json = json.dumps(opponent)
 
-        if "error" in result:
+        # Battle phase
+        try:
+            result = json.loads(self._session.battle(opponent_json))
+        except Exception as e:
             return self._encode_obs(), -1.0, True, False, {
-                "error": result["error"],
-                **self._make_info(),
+                "error": str(e), **self._make_info()
             }
 
         reward = float(result["reward"])
         terminated = result["game_over"]
 
-        self._server_state = result["state"]
+        self._state = result["state"]
         self._sync_local_state()
         self._pending_actions = []
 
@@ -294,9 +232,13 @@ class OABEnv(gym.Env):
     # ── Local State Tracking ──
 
     def _sync_local_state(self):
-        s = self._server_state
+        s = self._state
         self._hand = list(s["hand"])
         self._board = list(s["board"])
+        while len(self._hand) < HAND_SIZE:
+            self._hand.append(None)
+        while len(self._board) < BOARD_SIZE:
+            self._board.append(None)
         self._mana = s["mana"]
         self._mana_limit = s["mana_limit"]
 
@@ -388,7 +330,7 @@ class OABEnv(gym.Env):
                 obs[idx + 7] = _norm(len(unit.get("shop_abilities", [])), MAX_ABILITIES)
             idx += BOARD_FEATURES
 
-        s = self._server_state
+        s = self._state
         obs[idx + 0] = _norm(self._mana, MAX_MANA)
         obs[idx + 1] = _norm(self._mana_limit, MAX_MANA)
         obs[idx + 2] = _norm(s["round"], MAX_ROUND)
@@ -399,7 +341,7 @@ class OABEnv(gym.Env):
         return obs
 
     def _make_info(self):
-        s = self._server_state
+        s = self._state
         return {"round": s["round"], "lives": s["lives"], "wins": s["wins"]}
 
 
@@ -416,7 +358,6 @@ def _norm_id(card_id):
 
 
 def _extract_card_id(unit):
-    """Extract integer card_id from a unit dict."""
     cid = unit.get("id", 0)
     if isinstance(cid, dict):
         cid = next(iter(cid.values()), 0)
