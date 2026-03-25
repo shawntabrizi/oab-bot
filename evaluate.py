@@ -18,7 +18,7 @@ from sb3_contrib import MaskablePPO
 from env import OABEnv, BoardPool, ACTION_TABLE
 
 
-def run_evaluation(model, server_url, set_id, num_agents, num_games):
+def run_evaluation(model, set_id, num_agents, num_games):
     """Run games with self-play and collect statistics."""
     board_pool = BoardPool(max_size=200)
 
@@ -37,12 +37,7 @@ def run_evaluation(model, server_url, set_id, num_agents, num_games):
     while games_completed < num_games:
         # Create a lobby of agents
         envs = [
-            OABEnv(
-                server_url=server_url,
-                set_id=set_id,
-                agent_id=f"eval_{i}",
-                board_pool=board_pool,
-            )
+            OABEnv(set_id=set_id, board_pool=board_pool)
             for i in range(num_agents)
         ]
 
@@ -184,8 +179,6 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate OAB RL agent")
     parser.add_argument("--model-path", default="models/oab_agent",
                         help="Path to trained model (without .zip)")
-    parser.add_argument("--server-url", default="http://localhost:3000",
-                        help="Game server URL")
     parser.add_argument("--set-id", type=int, default=0,
                         help="Card set ID")
     parser.add_argument("--num-agents", type=int, default=10,
@@ -201,7 +194,7 @@ def main():
         f"{args.num_games} games, {args.num_agents}-agent lobby, set {args.set_id}"
     )
     results, card_stats = run_evaluation(
-        model, args.server_url, args.set_id, args.num_agents, args.num_games
+        model, args.set_id, args.num_agents, args.num_games
     )
     print_summary(results, card_stats, args.set_id)
 
