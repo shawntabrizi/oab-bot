@@ -15,13 +15,25 @@ open-auto-battler (separate repo)          oab-bot (this repo)
 ┌──────────────────────────┐              ┌──────────────────────────┐
 │  Rust game server        │   HTTP       │  Python RL training      │
 │  localhost:3000          │◄────────────►│  Gymnasium + SB3         │
-│  POST /reset             │              │                          │
-│  POST /submit            │              │  env.py    (gym wrapper) │
-│  GET  /state             │              │  train.py  (PPO)         │
-│  GET  /cards             │              │  evaluate.py (stats)     │
-│  GET  /sets              │              │  models/   (saved .zip)  │
+│  Multi-session local mode│              │                          │
+│  POST /reset             │              │  env.py    (gym wrapper) │
+│  POST /shop              │              │  train.py  (self-play)   │
+│  POST /battle            │              │  evaluate.py (stats)     │
+│  GET  /state?agent_id=X  │              │  models/   (saved .zip)  │
+│  GET  /cards, /sets      │              │                          │
 └──────────────────────────┘              └──────────────────────────┘
 ```
+
+### Self-Play Training
+
+N agents (default 10) share a `BoardPool`. Each agent runs independently:
+1. Agent does shop actions → `POST /shop`
+2. Posts its board to the shared pool
+3. Samples a random opponent from the pool
+4. Runs battle → `POST /battle`
+
+As training progresses, the pool fills with stronger boards, so opponents
+get harder. All agents share the same neural network policy (MaskablePPO).
 
 **Prerequisite**: Start the game server from open-auto-battler before training:
 
@@ -31,24 +43,23 @@ cargo run -p oab-server --release
 # Server runs on localhost:3000
 ```
 
-## Game Server API
+## Game Server API (Local Mode)
 
 ### POST /reset
 
-Start a new game. Returns initial `GameStateResponse`.
+Start a new game session for an agent. Returns initial `GameStateResponse`.
 
 ```json
-// Request (optional body)
-{ "seed": 12345, "set_id": 0 }
+{ "agent_id": "a0", "seed": 12345, "set_id": 0 }
 ```
 
-### POST /submit
+### POST /shop
 
-Submit turn actions, triggers battle. Returns `StepResponse`.
+Apply shop actions. Returns post-shop `GameStateResponse` (board visible).
 
 ```json
-// Request
 {
+  "agent_id": "a0",
   "actions": [
     { "type": "BurnFromHand", "hand_index": 0 },
     { "type": "PlayFromHand", "hand_index": 1, "board_slot": 0 }
@@ -56,7 +67,21 @@ Submit turn actions, triggers battle. Returns `StepResponse`.
 }
 ```
 
-### GET /state
+### POST /battle
+
+Run battle against provided opponent. Returns `StepResponse`.
+
+```json
+{
+  "agent_id": "a0",
+  "opponent": [
+    { "card_id": 5, "slot": 0, "perm_attack": 0, "perm_health": 0 },
+    { "card_id": 8, "slot": 1 }
+  ]
+}
+```
+
+### GET /state?agent_id=a0
 
 Returns current `GameStateResponse`.
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Train an RL agent for Open Auto Battler using MaskablePPO.
+"""Train an RL agent for Open Auto Battler using self-play.
+
+Runs a lobby of N agents that share a BoardPool. Each agent plays
+independently but faces opponents drawn from the pool of boards
+produced by all agents across recent rounds.
 
 Usage:
     # Start the game server first:
@@ -7,7 +11,7 @@ Usage:
 
     # Then train:
     python train.py
-    python train.py --timesteps 1000000 --set-id 1
+    python train.py --lobby-size 10 --timesteps 1000000
 """
 
 import argparse
@@ -16,15 +20,29 @@ import os
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 
-from env import OABEnv
+from env import OABEnv, BoardPool
+
+
+def make_env(server_url, set_id, agent_id, board_pool):
+    """Factory for creating an OABEnv with shared board pool."""
+    def _init():
+        return OABEnv(
+            server_url=server_url,
+            set_id=set_id,
+            agent_id=agent_id,
+            board_pool=board_pool,
+        )
+    return _init
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train OAB RL agent")
+    parser = argparse.ArgumentParser(description="Train OAB RL agent with self-play")
     parser.add_argument("--server-url", default="http://localhost:3000",
                         help="Game server URL")
     parser.add_argument("--set-id", type=int, default=0,
                         help="Card set ID to train on")
+    parser.add_argument("--lobby-size", type=int, default=10,
+                        help="Number of agents in self-play lobby")
     parser.add_argument("--timesteps", type=int, default=500_000,
                         help="Total training timesteps")
     parser.add_argument("--save-path", default="models/oab_agent",
@@ -38,15 +56,27 @@ def main():
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    env = OABEnv(server_url=args.server_url, set_id=args.set_id)
+    # Shared board pool for self-play
+    board_pool = BoardPool(max_size=200)
+
+    # Create vectorized env with N agents sharing the pool
+    from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+
+    env_fns = [
+        make_env(args.server_url, args.set_id, f"a{i}", board_pool)
+        for i in range(args.lobby_size)
+    ]
+
+    # DummyVecEnv runs all envs in one process (shares the BoardPool in memory)
+    vec_env = DummyVecEnv(env_fns)
 
     if args.resume:
         print(f"Resuming training from {args.resume}")
-        model = MaskablePPO.load(args.resume, env=env)
+        model = MaskablePPO.load(args.resume, env=vec_env)
     else:
         model = MaskablePPO(
             "MlpPolicy",
-            env,
+            vec_env,
             verbose=1,
             tensorboard_log=args.log_dir,
             learning_rate=3e-4,
@@ -63,9 +93,11 @@ def main():
         name_prefix="oab_checkpoint",
     )
 
-    print(f"Training for {args.timesteps} timesteps on set {args.set_id}...")
-    print(f"Server: {args.server_url}")
-    print(f"TensorBoard: tensorboard --logdir {args.log_dir}")
+    print(f"Training with {args.lobby_size}-agent self-play lobby")
+    print(f"  Timesteps: {args.timesteps}")
+    print(f"  Set: {args.set_id}")
+    print(f"  Server: {args.server_url}")
+    print(f"  TensorBoard: tensorboard --logdir {args.log_dir}")
 
     model.learn(
         total_timesteps=args.timesteps,
