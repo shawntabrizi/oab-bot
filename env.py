@@ -118,6 +118,9 @@ class OABEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
+    # Max actions per turn before forcing EndTurn
+    MAX_ACTIONS_PER_TURN = 15
+
     def __init__(self, set_id=0, board_pool=None):
         super().__init__()
         self.set_id = set_id
@@ -157,6 +160,12 @@ class OABEnv(gym.Env):
             return self._encode_obs(), 0.0, False, False, self._make_info()
 
     def action_masks(self):
+        # Force EndTurn if action limit reached
+        if len(self._pending_actions) >= self.MAX_ACTIONS_PER_TURN:
+            mask = np.zeros(NUM_ACTIONS, dtype=bool)
+            mask[0] = True  # EndTurn is action 0
+            return mask
+
         mask = np.zeros(NUM_ACTIONS, dtype=bool)
         for i, (action_type, params) in enumerate(ACTION_TABLE):
             mask[i] = self._is_valid(action_type, params)

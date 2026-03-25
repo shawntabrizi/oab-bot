@@ -17,6 +17,9 @@ pylib/target/
 models/
 logs/
 
+# Server logs
+*.log
+
 # IDE
 .idea/
 .vscode/
