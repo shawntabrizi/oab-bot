@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """Gymnasium environment for Open Auto Battler with self-play support.
 
-Uses the native PyO3 bindings (oab_py) for direct game engine access,
-bypassing the HTTP server entirely.
+Two-phase turn design:
+  1. Economy phase: burn/play/sell cards one at a time
+  2. Ordering phase: pick a board permutation (single action)
 
-Each gym step is one action within a shop turn. The 'EndTurn' action
-submits shop actions, picks an opponent from the shared board pool,
-runs the battle, and returns the result.
+Uses native PyO3 bindings (oab_py) for direct game engine access.
 """
 
 import json
 import random
 import threading
-from itertools import combinations
+from itertools import permutations
 
 import gymnasium as gym
 import numpy as np
@@ -40,47 +39,56 @@ MAX_CARD_ID = 100.0
 MAX_ABILITIES = 5.0
 
 # ── Observation Layout ──
+# Hand:  5 slots × 9 features = 45
+# Board: 5 slots × 8 features = 40
+# Scalars: 7 (mana, mana_limit, round, lives, wins, bag_count, phase)
+# Total: 92
 
 HAND_FEATURES = 9
 BOARD_FEATURES = 8
-SCALAR_FEATURES = 6
+SCALAR_FEATURES = 7
 
 OBS_DIM = HAND_SIZE * HAND_FEATURES + BOARD_SIZE * BOARD_FEATURES + SCALAR_FEATURES
 
 
-# ── Action Table ──
+# ── Action Layout ──
+#
+# Economy actions (0-15):
+#   0:     DoneEconomy (transition to ordering phase)
+#   1-5:   BurnFromHand(0-4)
+#   6-10:  PlayFromHand(0-4) — plays to first empty board slot
+#   11-15: SellFromBoard(0-4)
+#
+# Ordering actions (16-136):
+#   16:    KeepOrder (submit turn as-is)
+#   17+:   Permutation indices (up to 120 for 5 units)
+#
+# Total: 137 actions
 
-def _build_action_table():
-    actions = []
-    actions.append(("EndTurn", {}))
-    for i in range(HAND_SIZE):
-        actions.append(("BurnFromHand", {"hand_index": i}))
-    for hi in range(HAND_SIZE):
-        for bs in range(BOARD_SIZE):
-            actions.append(("PlayFromHand", {"hand_index": hi, "board_slot": bs}))
-    for bs in range(BOARD_SIZE):
-        actions.append(("BurnFromBoard", {"board_slot": bs}))
-    for a, b in combinations(range(BOARD_SIZE), 2):
-        actions.append(("SwapBoard", {"slot_a": a, "slot_b": b}))
-    for f in range(BOARD_SIZE):
-        for t in range(BOARD_SIZE):
-            if f != t:
-                actions.append(("MoveBoard", {"from_slot": f, "to_slot": t}))
-    return actions
+ECONOMY_DONE = 0
+BURN_START = 1
+BURN_END = 5
+PLAY_START = 6
+PLAY_END = 10
+SELL_START = 11
+SELL_END = 15
 
+ORDER_KEEP = 16
+ORDER_PERM_START = 17
 
-ACTION_TABLE = _build_action_table()
-NUM_ACTIONS = len(ACTION_TABLE)  # 66
+# Pre-compute all permutations for 1-5 units
+# _PERMS[n] = list of permutation tuples for n items
+_PERMS = {n: list(permutations(range(n))) for n in range(1, BOARD_SIZE + 1)}
+
+# Max permutations = 5! = 120, plus KeepOrder = 121 ordering actions
+MAX_ORDER_ACTIONS = 121
+NUM_ACTIONS = 16 + MAX_ORDER_ACTIONS  # 137
 
 
 # ── Shared Opponent Pool ──
 
 class BoardPool:
-    """Thread-safe pool of opponent boards from recent rounds.
-
-    All agents in a self-play lobby share one pool. When an agent finishes
-    shopping, it posts its board and samples an opponent from the pool.
-    """
+    """Thread-safe pool of opponent boards from recent rounds."""
 
     def __init__(self, max_size=200):
         self._boards = []
@@ -107,19 +115,15 @@ class BoardPool:
 # ── Gymnasium Environment ──
 
 class OABEnv(gym.Env):
-    """Open Auto Battler environment with self-play.
+    """Open Auto Battler environment with two-phase turns.
 
-    Uses native PyO3 bindings — no HTTP server needed.
+    Phase 1 (Economy): Burn, play, sell cards. Action space: 0-15.
+    Phase 2 (Ordering): Pick board permutation. Action space: 16-136.
 
-    Observation: Box(91,) normalized to [0, 1]
-    Action: Discrete(66) with action masking
-    Reward: +1 win, -1 loss, 0 draw (per battle round)
+    After ordering, the turn is submitted automatically (shop + battle).
     """
 
     metadata = {"render_modes": []}
-
-    # Max actions per turn before forcing EndTurn
-    MAX_ACTIONS_PER_TURN = 15
 
     def __init__(self, set_id=0, board_pool=None):
         super().__init__()
@@ -139,6 +143,7 @@ class OABEnv(gym.Env):
         self._mana = 0
         self._mana_limit = 0
         self._pending_actions = []
+        self._phase = "economy"  # "economy" or "ordering"
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -147,42 +152,147 @@ class OABEnv(gym.Env):
         self._state = json.loads(self._session.get_state())
         self._sync_local_state()
         self._pending_actions = []
+        self._phase = "economy"
         return self._encode_obs(), self._make_info()
 
     def step(self, action):
-        action_type, params = ACTION_TABLE[int(action)]
+        action = int(action)
 
-        if action_type == "EndTurn":
-            return self._do_end_turn()
+        if self._phase == "economy":
+            return self._step_economy(action)
         else:
-            self._pending_actions.append((action_type, params))
-            self._apply_local_action(action_type, params)
-            return self._encode_obs(), 0.0, False, False, self._make_info()
+            return self._step_ordering(action)
 
     def action_masks(self):
-        # Force EndTurn if action limit reached
-        if len(self._pending_actions) >= self.MAX_ACTIONS_PER_TURN:
-            mask = np.zeros(NUM_ACTIONS, dtype=bool)
-            mask[0] = True  # EndTurn is action 0
-            return mask
-
         mask = np.zeros(NUM_ACTIONS, dtype=bool)
-        for i, (action_type, params) in enumerate(ACTION_TABLE):
-            mask[i] = self._is_valid(action_type, params)
+
+        if self._phase == "economy":
+            # DoneEconomy is always valid
+            mask[ECONOMY_DONE] = True
+
+            # BurnFromHand
+            for i in range(HAND_SIZE):
+                if self._hand[i] is not None:
+                    mask[BURN_START + i] = True
+
+            # PlayFromHand (to first empty slot)
+            has_empty = any(s is None for s in self._board)
+            for i in range(HAND_SIZE):
+                card = self._hand[i]
+                if card is not None and has_empty and self._mana >= card["play_cost"]:
+                    mask[PLAY_START + i] = True
+
+            # SellFromBoard
+            for i in range(BOARD_SIZE):
+                if self._board[i] is not None:
+                    mask[SELL_START + i] = True
+
+        else:  # ordering phase
+            occupied = [i for i in range(BOARD_SIZE) if self._board[i] is not None]
+            n = len(occupied)
+
+            # KeepOrder is always valid
+            mask[ORDER_KEEP] = True
+
+            # Permutations (skip identity which is KeepOrder)
+            if n >= 2:
+                identity = tuple(range(n))
+                for perm_idx, perm in enumerate(_PERMS[n]):
+                    if perm != identity:
+                        action_idx = ORDER_PERM_START + perm_idx
+                        if action_idx < NUM_ACTIONS:
+                            mask[action_idx] = True
+
         return mask
 
-    def get_board_as_opponent(self):
-        """Return current board in OpponentUnit format."""
-        opponent = []
-        for slot, unit in enumerate(self._board):
-            if unit is not None:
-                opponent.append({"card_id": _extract_card_id(unit), "slot": slot})
-        return opponent
+    # ── Economy Phase ──
+
+    def _step_economy(self, action):
+        if action == ECONOMY_DONE:
+            # Transition to ordering phase
+            self._phase = "ordering"
+            return self._encode_obs(), 0.0, False, False, self._make_info()
+
+        if BURN_START <= action <= BURN_END:
+            i = action - BURN_START
+            card = self._hand[i]
+            if card:
+                self._pending_actions.append(("BurnFromHand", {"hand_index": i}))
+                self._mana = min(self._mana + card["burn_value"], self._mana_limit)
+                self._hand[i] = None
+
+        elif PLAY_START <= action <= PLAY_END:
+            i = action - PLAY_START
+            card = self._hand[i]
+            if card:
+                # Find first empty board slot
+                slot = next((j for j in range(BOARD_SIZE) if self._board[j] is None), None)
+                if slot is not None:
+                    self._pending_actions.append(
+                        ("PlayFromHand", {"hand_index": i, "board_slot": slot})
+                    )
+                    self._mana -= card["play_cost"]
+                    self._board[slot] = card
+                    self._hand[i] = None
+
+        elif SELL_START <= action <= SELL_END:
+            j = action - SELL_START
+            unit = self._board[j]
+            if unit:
+                self._pending_actions.append(("BurnFromBoard", {"board_slot": j}))
+                self._mana = min(self._mana + unit["burn_value"], self._mana_limit)
+                self._board[j] = None
+
+        return self._encode_obs(), 0.0, False, False, self._make_info()
+
+    # ── Ordering Phase ──
+
+    def _step_ordering(self, action):
+        occupied = [i for i in range(BOARD_SIZE) if self._board[i] is not None]
+        n = len(occupied)
+
+        if action != ORDER_KEEP and n >= 2:
+            perm_idx = action - ORDER_PERM_START
+            if 0 <= perm_idx < len(_PERMS[n]):
+                perm = _PERMS[n][perm_idx]
+                # Build swap actions to achieve the target permutation
+                units = [self._board[occupied[j]] for j in range(n)]
+                target_slots = [occupied[p] for p in perm]
+
+                # Clear occupied slots and place in new order
+                for slot in occupied:
+                    self._board[slot] = None
+                for unit, slot in zip(units, target_slots):
+                    self._board[slot] = unit
+
+                # Generate SwapBoard actions for the server
+                self._generate_swap_actions(occupied, perm)
+
+        # Submit the full turn
+        return self._submit_turn()
+
+    def _generate_swap_actions(self, occupied, perm):
+        """Generate minimal SwapBoard actions to achieve a permutation.
+
+        Uses selection sort: for each position, swap the correct element into place.
+        """
+        current = list(range(len(occupied)))
+        for i in range(len(current)):
+            target = perm[i]
+            if current[i] != target:
+                # Find where target currently is
+                j = current.index(target)
+                # Swap in current tracking
+                current[i], current[j] = current[j], current[i]
+                # Record the swap action using actual board slots
+                self._pending_actions.append(
+                    ("SwapBoard", {"slot_a": occupied[i], "slot_b": occupied[j]})
+                )
 
     # ── Turn Submission ──
 
-    def _do_end_turn(self):
-        # Build actions JSON
+    def _submit_turn(self):
+        """Submit all pending actions to the game engine."""
         server_actions = []
         for action_type, params in self._pending_actions:
             action = {"type": action_type}
@@ -195,7 +305,6 @@ class OABEnv(gym.Env):
         try:
             shop_result = json.loads(self._session.shop(actions_json))
         except Exception:
-            # Fallback: empty shop
             try:
                 shop_result = json.loads(self._session.shop("[]"))
             except Exception as e:
@@ -207,7 +316,7 @@ class OABEnv(gym.Env):
         self._sync_local_state()
 
         # Post board to pool and sample opponent
-        my_board = self.get_board_as_opponent()
+        my_board = self._get_board_as_opponent()
         if self.board_pool is not None:
             self.board_pool.add(my_board)
             opponent = self.board_pool.sample()
@@ -230,6 +339,7 @@ class OABEnv(gym.Env):
         self._state = result["state"]
         self._sync_local_state()
         self._pending_actions = []
+        self._phase = "economy"
 
         info = self._make_info()
         info["battle_result"] = result["battle_result"]
@@ -238,7 +348,7 @@ class OABEnv(gym.Env):
 
         return self._encode_obs(), reward, terminated, False, info
 
-    # ── Local State Tracking ──
+    # ── State Tracking ──
 
     def _sync_local_state(self):
         s = self._state
@@ -251,60 +361,12 @@ class OABEnv(gym.Env):
         self._mana = s["mana"]
         self._mana_limit = s["mana_limit"]
 
-    def _apply_local_action(self, action_type, params):
-        if action_type == "BurnFromHand":
-            i = params["hand_index"]
-            card = self._hand[i]
-            if card:
-                self._mana = min(self._mana + card["burn_value"], self._mana_limit)
-                self._hand[i] = None
-        elif action_type == "PlayFromHand":
-            i, j = params["hand_index"], params["board_slot"]
-            card = self._hand[i]
-            if card:
-                self._mana -= card["play_cost"]
-                self._board[j] = card
-                self._hand[i] = None
-        elif action_type == "BurnFromBoard":
-            j = params["board_slot"]
-            unit = self._board[j]
-            if unit:
-                self._mana = min(self._mana + unit["burn_value"], self._mana_limit)
-                self._board[j] = None
-        elif action_type == "SwapBoard":
-            a, b = params["slot_a"], params["slot_b"]
-            self._board[a], self._board[b] = self._board[b], self._board[a]
-        elif action_type == "MoveBoard":
-            f, t = params["from_slot"], params["to_slot"]
-            unit = self._board[f]
-            if f < t:
-                for k in range(f, t):
-                    self._board[k] = self._board[k + 1]
-            else:
-                for k in range(f, t, -1):
-                    self._board[k] = self._board[k - 1]
-            self._board[t] = unit
-
-    # ── Action Masking ──
-
-    def _is_valid(self, action_type, params):
-        if action_type == "EndTurn":
-            return True
-        if action_type == "BurnFromHand":
-            return self._hand[params["hand_index"]] is not None
-        if action_type == "PlayFromHand":
-            i, j = params["hand_index"], params["board_slot"]
-            card = self._hand[i]
-            return card is not None and self._board[j] is None and self._mana >= card["play_cost"]
-        if action_type == "BurnFromBoard":
-            return self._board[params["board_slot"]] is not None
-        if action_type == "SwapBoard":
-            a, b = params["slot_a"], params["slot_b"]
-            return self._board[a] is not None and self._board[b] is not None
-        if action_type == "MoveBoard":
-            f, t = params["from_slot"], params["to_slot"]
-            return self._board[f] is not None and self._board[t] is not None
-        return False
+    def _get_board_as_opponent(self):
+        opponent = []
+        for slot, unit in enumerate(self._board):
+            if unit is not None:
+                opponent.append({"card_id": _extract_card_id(unit), "slot": slot})
+        return opponent
 
     # ── Observation Encoding ──
 
@@ -346,12 +408,18 @@ class OABEnv(gym.Env):
         obs[idx + 3] = _norm(s["lives"], MAX_LIVES)
         obs[idx + 4] = _norm(s["wins"], MAX_WINS)
         obs[idx + 5] = _norm(s["bag_count"], MAX_BAG)
+        obs[idx + 6] = 1.0 if self._phase == "ordering" else 0.0
 
         return obs
 
     def _make_info(self):
         s = self._state
-        return {"round": s["round"], "lives": s["lives"], "wins": s["wins"]}
+        return {
+            "round": s["round"],
+            "lives": s["lives"],
+            "wins": s["wins"],
+            "phase": self._phase,
+        }
 
 
 # ── Helpers ──

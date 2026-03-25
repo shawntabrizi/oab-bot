@@ -151,9 +151,12 @@ class GameStateTracker:
     observations it was trained on.
     """
 
+    MAX_ACTIONS_PER_TURN = 15
+
     def __init__(self):
         self.hand = [None] * HAND_SIZE
         self.board = [None] * BOARD_SIZE
+        self.actions_this_turn = 0
         self.mana = 0
         self.mana_limit = 0
         self.state = None
@@ -169,6 +172,7 @@ class GameStateTracker:
             self.board.append(None)
         self.mana = state["mana"]
         self.mana_limit = state["mana_limit"]
+        self.actions_this_turn = 0
 
     def apply_action(self, action_type, params):
         """Apply an action locally (before sending to server)."""
@@ -249,6 +253,11 @@ class GameStateTracker:
 
     def action_masks(self):
         """Compute valid action mask (matches env.py)."""
+        if self.actions_this_turn >= self.MAX_ACTIONS_PER_TURN:
+            mask = np.zeros(NUM_ACTIONS, dtype=bool)
+            mask[0] = True  # Force EndTurn
+            return mask
+
         mask = np.zeros(NUM_ACTIONS, dtype=bool)
         for i, (action_type, params) in enumerate(ACTION_TABLE):
             mask[i] = self._is_valid(action_type, params)
@@ -465,6 +474,7 @@ def play_game(model, client, tracker, game_num, verbose=True):
                 action_log.append(_format_action(action_type, params, tracker))
             pending_actions.append((action_type, params))
             tracker.apply_action(action_type, params)
+            tracker.actions_this_turn += 1
 
 
 def main():
