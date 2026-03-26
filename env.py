@@ -9,8 +9,6 @@ Uses native PyO3 bindings (oab_py) for direct game engine access.
 """
 
 import json
-import random
-import threading
 
 import gymnasium as gym
 import numpy as np
@@ -18,8 +16,6 @@ from gymnasium import spaces
 
 import oab_py
 from oab_shared import (
-    HAND_SIZE,
-    BOARD_SIZE,
     OBS_DIM,
     NUM_ACTIONS,
     ACTION_TABLE,
@@ -27,35 +23,9 @@ from oab_shared import (
     DEFAULT_REPEAT_PENALTY,
     DEFAULT_MAX_ACTIONS_PER_TURN,
     GameStateTracker,
-    extract_card_id,
+    BoardPool,
+    MatchedPool,
 )
-
-
-# ── Shared Opponent Pool ──
-
-class BoardPool:
-    """Thread-safe pool of opponent boards from recent rounds."""
-
-    def __init__(self, max_size=200):
-        self._boards = []
-        self._lock = threading.Lock()
-        self._max_size = max_size
-
-    def add(self, board):
-        with self._lock:
-            self._boards.append(board)
-            if len(self._boards) > self._max_size:
-                self._boards = self._boards[-self._max_size // 2 :]
-
-    def sample(self):
-        with self._lock:
-            if not self._boards:
-                return []
-            return random.choice(self._boards)
-
-    def __len__(self):
-        with self._lock:
-            return len(self._boards)
 
 
 # ── Gymnasium Environment ──
@@ -154,9 +124,12 @@ class OABEnv(gym.Env):
         self._tracker.sync(state)
 
         my_board = self._tracker.get_board_as_opponent()
+        round_num = self._tracker.state["round"]
+        wins = self._tracker.state["wins"]
+        lives = self._tracker.state["lives"]
         if self.board_pool is not None:
-            self.board_pool.add(my_board)
-            opponent = self.board_pool.sample()
+            self.board_pool.add(round_num, wins, lives, my_board)
+            opponent = self.board_pool.sample(round_num, wins, lives)
         else:
             opponent = []
 

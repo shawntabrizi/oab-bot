@@ -20,8 +20,8 @@ from collections import defaultdict
 import numpy as np
 from sb3_contrib import MaskablePPO
 
-from env import OABEnv, BoardPool
-from oab_shared import ACTION_TABLE
+from env import OABEnv
+from oab_shared import ACTION_TABLE, BoardPool, MatchedPool
 
 
 def wilson_ci(successes, total, z=1.96):
@@ -38,9 +38,9 @@ def wilson_ci(successes, total, z=1.96):
     return (max(0.0, center - spread) * 100, min(1.0, center + spread) * 100)
 
 
-def run_evaluation(model, set_id, num_games, shared_pool=False):
+def run_evaluation(model, set_id, num_games, shared_pool=False, matched=True):
     """Run games and collect statistics."""
-    pool = BoardPool(max_size=200)
+    pool = MatchedPool() if matched else BoardPool(max_size=200)
 
     results = []
     card_stats = defaultdict(lambda: {

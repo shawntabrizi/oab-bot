@@ -24,7 +24,8 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from config import TrainConfig, load_config, save_config
-from env import OABEnv, BoardPool
+from env import OABEnv
+from oab_shared import BoardPool, MatchedPool
 
 
 def make_env(config, board_pool):
@@ -74,7 +75,10 @@ def main():
     os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
     os.makedirs(config.log_dir, exist_ok=True)
 
-    board_pool = BoardPool(max_size=config.board_pool_size)
+    if config.matched_pool:
+        board_pool = MatchedPool(max_per_bucket=config.max_boards_per_bucket)
+    else:
+        board_pool = BoardPool(max_size=config.board_pool_size)
 
     env_fns = [make_env(config, board_pool) for _ in range(config.lobby_size)]
     vec_env = DummyVecEnv(env_fns)
@@ -107,6 +111,8 @@ def main():
     print(f"  Set: {config.set_id}")
     print(f"  LR: {config.learning_rate}, Batch: {config.batch_size}, Epochs: {config.n_epochs}")
     print(f"  Action cost: {config.action_cost}, Repeat penalty: {config.repeat_penalty}")
+    pool_type = "matched" if config.matched_pool else "flat"
+    print(f"  Pool: {pool_type}")
     print(f"  TensorBoard: tensorboard --logdir {config.log_dir}")
 
     model.learn(

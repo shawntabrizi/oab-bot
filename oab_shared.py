@@ -3,8 +3,12 @@
 Used by env.py (training), play.py (live games), and evaluate.py (analysis).
 """
 
-import numpy as np
+import random
+import threading
+from collections import defaultdict
 from itertools import combinations
+
+import numpy as np
 
 # ── Game Constants ──
 
@@ -243,3 +247,89 @@ class GameStateTracker:
             if unit is not None:
                 opponent.append({"card_id": extract_card_id(unit), "slot": slot})
         return opponent
+
+
+# ── Opponent Pools ──
+
+class BoardPool:
+    """Thread-safe flat pool of opponent boards (no matchmaking).
+
+    Accepts (round_num, wins, lives, board) for add() and
+    (round_num, wins, lives) for sample() but ignores the
+    progression args — just stores and samples randomly.
+    """
+
+    def __init__(self, max_size=200):
+        self._boards = []
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    def add(self, round_num, wins, lives, board):
+        with self._lock:
+            self._boards.append(board)
+            if len(self._boards) > self._max_size:
+                self._boards = self._boards[-self._max_size // 2 :]
+
+    def sample(self, round_num, wins, lives):
+        with self._lock:
+            if not self._boards:
+                return []
+            return random.choice(self._boards)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._boards)
+
+
+class MatchedPool:
+    """Thread-safe opponent pool with progression-based matchmaking.
+
+    Boards are bucketed by (round, wins, lives). Sampling uses tiered
+    fallback: exact match > same round + similar wins > same round > any.
+    """
+
+    def __init__(self, max_per_bucket=50):
+        self._pool = defaultdict(list)
+        self._lock = threading.Lock()
+        self._max = max_per_bucket
+
+    def add(self, round_num, wins, lives, board):
+        key = (round_num, wins, lives)
+        with self._lock:
+            bucket = self._pool[key]
+            bucket.append(board)
+            if len(bucket) > self._max:
+                bucket[:] = bucket[-self._max // 2 :]
+
+    def sample(self, round_num, wins, lives):
+        with self._lock:
+            # Tier 1: exact match
+            exact = self._pool.get((round_num, wins, lives))
+            if exact:
+                return random.choice(exact)
+
+            # Tier 2: same round, wins ±1, any lives
+            close = []
+            for w_off in (0, 1, -1):
+                for l in range(4):
+                    bucket = self._pool.get((round_num, wins + w_off, l))
+                    if bucket:
+                        close.extend(bucket)
+            if close:
+                return random.choice(close)
+
+            # Tier 3: same round, any progression
+            same_round = []
+            for key, boards in self._pool.items():
+                if key[0] == round_num:
+                    same_round.extend(boards)
+            if same_round:
+                return random.choice(same_round)
+
+            # Tier 4: anything
+            all_boards = [b for boards in self._pool.values() for b in boards]
+            return random.choice(all_boards) if all_boards else []
+
+    def __len__(self):
+        with self._lock:
+            return sum(len(b) for b in self._pool.values())

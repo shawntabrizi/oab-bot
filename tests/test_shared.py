@@ -340,6 +340,80 @@ def test_get_board_as_opponent_empty():
     assert tracker.get_board_as_opponent() == []
 
 
+# ── MatchedPool ──
+
+def test_matched_pool_exact_match():
+    from oab_shared import MatchedPool
+    pool = MatchedPool(max_per_bucket=10)
+    board_a = [{"card_id": 1, "slot": 0}]
+    board_b = [{"card_id": 2, "slot": 0}]
+    pool.add(3, 2, 3, board_a)  # round=3, wins=2, lives=3
+    pool.add(3, 2, 3, board_b)
+    pool.add(5, 0, 1, [{"card_id": 99, "slot": 0}])  # different progression
+    # Exact match should return one of the two boards at (3,2,3)
+    for _ in range(20):
+        result = pool.sample(3, 2, 3)
+        assert result in (board_a, board_b)
+
+
+def test_matched_pool_fallback_close():
+    """When no exact match, falls back to same round + similar wins."""
+    from oab_shared import MatchedPool
+    pool = MatchedPool(max_per_bucket=10)
+    board = [{"card_id": 5, "slot": 0}]
+    pool.add(3, 4, 2, board)  # round=3, wins=4, lives=2
+    # Sample (3, 3, 3) — no exact match, but wins=4 is within ±1 of 3
+    result = pool.sample(3, 3, 3)
+    assert result == board
+
+
+def test_matched_pool_fallback_same_round():
+    """When no close match, falls back to same round any progression."""
+    from oab_shared import MatchedPool
+    pool = MatchedPool(max_per_bucket=10)
+    board = [{"card_id": 5, "slot": 0}]
+    pool.add(3, 8, 1, board)  # round=3, wins=8 — far from wins=0
+    # Sample (3, 0, 3) — wins=8 is NOT within ±1 of 0, but same round
+    result = pool.sample(3, 0, 3)
+    assert result == board
+
+
+def test_matched_pool_fallback_any():
+    """When no same-round match, falls back to any board."""
+    from oab_shared import MatchedPool
+    pool = MatchedPool(max_per_bucket=10)
+    board = [{"card_id": 5, "slot": 0}]
+    pool.add(7, 5, 2, board)  # round=7
+    # Sample round=1 — nothing at round 1
+    result = pool.sample(1, 0, 3)
+    assert result == board
+
+
+def test_matched_pool_empty_returns_empty():
+    from oab_shared import MatchedPool
+    pool = MatchedPool()
+    assert pool.sample(1, 0, 3) == []
+
+
+def test_matched_pool_bucket_eviction():
+    """Buckets should evict old entries when full."""
+    from oab_shared import MatchedPool
+    pool = MatchedPool(max_per_bucket=4)
+    for i in range(10):
+        pool.add(1, 0, 3, [{"card_id": i, "slot": 0}])
+    assert len(pool) <= 4  # never exceeds max_per_bucket
+
+
+def test_board_pool_new_interface():
+    """BoardPool should accept round/wins/lives args (and ignore them)."""
+    from oab_shared import BoardPool
+    pool = BoardPool(max_size=10)
+    board = [{"card_id": 1, "slot": 0}]
+    pool.add(3, 2, 3, board)
+    result = pool.sample(3, 2, 3)
+    assert result == board
+
+
 # ── Config ──
 
 def test_config_defaults():
