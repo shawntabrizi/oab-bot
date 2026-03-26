@@ -25,13 +25,16 @@ def env():
 
 
 def test_obs_dim_from_rust():
-    assert oab_py.GameSession.obs_dim() == 546
+    session = oab_py.GameSession(0, 0)
+    # Dynamic — depends on card set, just verify it's positive
+    assert session.obs_dim() > 0
     assert oab_py.GameSession.num_actions() == 66
 
 
 def test_reset_returns_correct_shape(env):
     obs, info = env.reset()
-    assert obs.shape == (oab_py.GameSession.obs_dim(),)
+    session = oab_py.GameSession(0, env.set_id)
+    assert obs.shape == (session.obs_dim(),)
     assert obs.dtype == np.float32
     assert "round" in info
     assert "lives" in info
@@ -47,7 +50,7 @@ def test_obs_values_in_range(env):
 def test_action_masks_shape(env):
     env.reset()
     mask = env.action_masks()
-    assert mask.shape == (oab_py.GameSession.num_actions(),)
+    assert mask.shape == (66,)
     assert mask.dtype == bool
     assert mask[0] == True  # EndTurn always valid
 
@@ -55,7 +58,8 @@ def test_action_masks_shape(env):
 def test_step_endturn_triggers_battle(env):
     env.reset()
     obs, reward, terminated, truncated, info = env.step(0)
-    assert obs.shape == (oab_py.GameSession.obs_dim(),)
+    session = oab_py.GameSession(0, env.set_id)
+    assert obs.shape == (session.obs_dim(),)
     assert reward in (-1.0, 0.0, 1.0)
     assert "battle_result" in info
 
@@ -91,6 +95,5 @@ def test_board_pool_populated(env):
 def test_get_hand_names(env):
     env.reset()
     names = env.get_hand_names()
-    assert len(names) == 5
-    # At least some cards should have names
+    assert isinstance(names, list)
     assert any(n is not None for n in names)

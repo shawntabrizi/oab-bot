@@ -1,8 +1,8 @@
 //! Python bindings for the OAB game engine via PyO3.
 //!
-//! Exposes `GameSession` directly to Python. The hot-path training API
-//! returns observation vectors and action masks directly (no JSON).
-//! Legacy JSON methods are kept for play.py and debugging.
+//! The training API applies each action through the real game engine
+//! (apply_single_action) — no shadow simulator. Observations and masks
+//! are derived from the authoritative engine state after every action.
 
 mod actions;
 mod obs;
@@ -13,7 +13,10 @@ use oab_battle::battle::{
     player_permanent_stat_deltas_from_events, player_shop_mana_delta_from_events, resolve_battle,
     BattleResult, CombatEvent, CombatUnit, UnitId,
 };
-use oab_battle::commit::{apply_shop_start_triggers, apply_shop_start_triggers_with_result};
+use oab_battle::commit::{
+    apply_shop_start_triggers, apply_shop_start_triggers_with_result, apply_single_action,
+    finalize_turn, ShopTurnContext,
+};
 use oab_battle::rng::XorShiftRng;
 use oab_battle::types::*;
 use oab_game::sealed::{create_starting_bag, default_config};
@@ -32,27 +35,36 @@ struct GameSession {
     state: oab_game::GameState,
     card_set: oab_battle::state::CardSet,
     obs_constants: obs::ObsConstants,
-    // Shadow state for local action tracking (avoids JSON round-trips)
-    shadow_hand: Vec<Option<CardId>>,
-    shadow_board: Vec<Option<BoardUnit>>,
-    shadow_mana: i32,
-    pending_actions: Vec<TurnAction>,
+    /// Engine context for incremental action application.
+    turn_ctx: ShopTurnContext,
+    /// Number of actions applied this turn.
+    action_count: usize,
     max_actions_per_turn: usize,
 }
 
 impl GameSession {
-    /// Sync shadow state from the canonical game state.
-    fn sync_shadow(&mut self) {
-        self.shadow_hand = self.state.shop.hand.iter().map(|cid| Some(*cid)).collect();
-        while self.shadow_hand.len() < self.obs_constants.hand_size {
-            self.shadow_hand.push(None);
-        }
-        self.shadow_board = self.state.shop.board.clone();
-        while self.shadow_board.len() < self.obs_constants.board_size {
-            self.shadow_board.push(None);
-        }
-        self.shadow_mana = self.state.shop.shop_mana;
-        self.pending_actions.clear();
+    /// Reset the turn context from the current canonical state.
+    fn reset_turn(&mut self) {
+        self.turn_ctx = ShopTurnContext::new(&self.state.shop);
+        self.action_count = 0;
+    }
+
+    /// Build the hand view for observation encoding.
+    /// Returns a Vec matching original hand size, with used cards as None.
+    fn hand_view(&self) -> Vec<Option<CardId>> {
+        self.state
+            .shop
+            .hand
+            .iter()
+            .enumerate()
+            .map(|(i, cid)| {
+                if self.turn_ctx.hand_used.get(i).copied().unwrap_or(false) {
+                    None
+                } else {
+                    Some(*cid)
+                }
+            })
+            .collect()
     }
 }
 
@@ -60,7 +72,6 @@ impl GameSession {
 impl GameSession {
     // ── Construction ──
 
-    /// Create a new game session with the given seed and card set ID.
     #[new]
     fn new(seed: u64, set_id: u32) -> PyResult<Self> {
         let card_pool = oab_assets::cards::build_pool();
@@ -89,156 +100,92 @@ impl GameSession {
             &state.config,
         );
 
-        let mut session = Self {
+        let turn_ctx = ShopTurnContext::new(&state.shop);
+
+        Ok(Self {
             state,
             card_set,
             obs_constants,
-            shadow_hand: Vec::new(),
-            shadow_board: Vec::new(),
-            shadow_mana: 0,
-            pending_actions: Vec::new(),
+            turn_ctx,
+            action_count: 0,
             max_actions_per_turn: DEFAULT_MAX_ACTIONS_PER_TURN,
-        };
-        session.sync_shadow();
-        Ok(session)
+        })
     }
 
-    // ── Training API (no JSON on hot path) ──
+    // ── Training API (engine-authoritative, no shadow) ──
 
-    /// Get observation as a flat list of floats.
+    /// Get observation from the real engine state.
     fn get_observation(&self) -> Vec<f32> {
+        let hand = self.hand_view();
         obs::encode_observation(
-            &self.shadow_hand,
-            &self.shadow_board,
-            self.shadow_mana,
+            &hand,
+            &self.state.shop.board,
+            self.turn_ctx.current_mana,
             &self.state,
             &self.obs_constants,
         )
     }
 
-    /// Get action mask as a list of bools (66 elements).
+    /// Get action mask from the real engine state.
     fn get_action_mask(&self) -> Vec<bool> {
+        let hand = self.hand_view();
         actions::compute_action_mask(
-            &self.shadow_hand,
-            &self.shadow_board,
-            self.shadow_mana,
-            self.pending_actions.len(),
+            &hand,
+            &self.state.shop.board,
+            self.turn_ctx.current_mana,
+            self.action_count,
             self.max_actions_per_turn,
             &self.state.shop.card_pool,
         )
     }
 
-    /// Apply an action locally (updates shadow state, adds to pending).
-    /// Returns true if the board/hand actually changed (false = no-op swap/move).
+    /// Apply a single action through the real game engine.
+    /// Returns true if the board changed (false = no-op swap/move).
     fn apply_action(&mut self, action_index: u32) -> PyResult<bool> {
         let turn_action = actions::action_to_turn_action(action_index)
             .ok_or_else(|| {
                 PyRuntimeError::new_err("Action 0 (EndTurn) should not be passed to apply_action")
             })?;
 
-        let pool = &self.state.shop.card_pool;
         let board_before: Vec<Option<CardId>> = self
-            .shadow_board
+            .state
+            .shop
+            .board
             .iter()
             .map(|s| s.as_ref().map(|u| u.card_id))
             .collect();
 
-        match &turn_action {
-            TurnAction::BurnFromHand { hand_index } => {
-                let i = *hand_index as usize;
-                if let Some(Some(card_id)) = self.shadow_hand.get(i) {
-                    if let Some(card) = pool.get(card_id) {
-                        self.shadow_mana = (self.shadow_mana + card.economy.burn_value)
-                            .min(self.state.shop.mana_limit);
-                    }
-                    self.shadow_hand[i] = None;
-                }
-            }
-            TurnAction::PlayFromHand {
-                hand_index,
-                board_slot,
-            } => {
-                let hi = *hand_index as usize;
-                let bs = *board_slot as usize;
-                if let Some(Some(card_id)) = self.shadow_hand.get(hi) {
-                    if let Some(card) = pool.get(card_id) {
-                        self.shadow_mana -= card.economy.play_cost;
-                    }
-                    self.shadow_board[bs] = Some(BoardUnit::new(*card_id));
-                    self.shadow_hand[hi] = None;
-                }
-            }
-            TurnAction::BurnFromBoard { board_slot } => {
-                let bs = *board_slot as usize;
-                if let Some(Some(unit)) = self.shadow_board.get(bs) {
-                    if let Some(card) = pool.get(&unit.card_id) {
-                        self.shadow_mana = (self.shadow_mana + card.economy.burn_value)
-                            .min(self.state.shop.mana_limit);
-                    }
-                }
-                if bs < self.shadow_board.len() {
-                    self.shadow_board[bs] = None;
-                }
-            }
-            TurnAction::SwapBoard { slot_a, slot_b } => {
-                let a = *slot_a as usize;
-                let b = *slot_b as usize;
-                self.shadow_board.swap(a, b);
-            }
-            TurnAction::MoveBoard {
-                from_slot,
-                to_slot,
-            } => {
-                let f = *from_slot as usize;
-                let t = *to_slot as usize;
-                let unit = self.shadow_board[f].take();
-                if f < t {
-                    for k in f..t {
-                        self.shadow_board[k] = self.shadow_board[k + 1].take();
-                    }
-                } else {
-                    for k in (t..f).rev() {
-                        let next = self.shadow_board[k].take();
-                        self.shadow_board[k + 1] = next;
-                    }
-                }
-                self.shadow_board[t] = unit;
-            }
-        }
+        // Apply through the REAL engine — includes insert-shift, OnBuy/OnSell triggers
+        apply_single_action(&mut self.state.shop, &mut self.turn_ctx, &turn_action)
+            .map_err(|e| PyRuntimeError::new_err(format!("Action failed: {:?}", e)))?;
 
-        self.pending_actions.push(turn_action);
+        self.action_count += 1;
 
-        // Check if board actually changed (for no-op detection)
         let board_after: Vec<Option<CardId>> = self
-            .shadow_board
+            .state
+            .shop
+            .board
             .iter()
             .map(|s| s.as_ref().map(|u| u.card_id))
             .collect();
-        Ok(board_before != board_after
-            || !matches!(
-                self.pending_actions.last(),
-                Some(TurnAction::SwapBoard { .. } | TurnAction::MoveBoard { .. })
-            ))
+
+        let is_reorder = matches!(
+            turn_action,
+            TurnAction::SwapBoard { .. } | TurnAction::MoveBoard { .. }
+        );
+
+        Ok(!is_reorder || board_before != board_after)
     }
 
-    /// Commit pending actions and run battle. Returns (reward, terminated, info_json).
+    /// Finalize the shop turn and run battle.
+    /// Returns (reward, terminated, info_json).
     fn commit_turn_and_battle(
         &mut self,
         opponent_json: &str,
     ) -> PyResult<(f32, bool, String)> {
-        // Submit shop actions
-        let action = CommitTurnAction {
-            actions: std::mem::take(&mut self.pending_actions),
-        };
-
-        if let Err(e) = oab_battle::commit::verify_and_apply_turn(&mut self.state.shop, &action) {
-            // Fallback: submit empty actions
-            let empty = CommitTurnAction {
-                actions: Vec::new(),
-            };
-            oab_battle::commit::verify_and_apply_turn(&mut self.state.shop, &empty)
-                .map_err(|e2| PyRuntimeError::new_err(format!("Shop failed: {:?}, {:?}", e, e2)))?;
-        }
+        // Finalize: remove used hand cards
+        let ctx = std::mem::replace(&mut self.turn_ctx, ShopTurnContext::new(&self.state.shop));
+        finalize_turn(&mut self.state.shop, ctx);
 
         self.state.shop.shop_mana = 0;
         self.state.phase = GamePhase::Battle;
@@ -290,8 +237,8 @@ impl GameSession {
             None
         };
 
-        // Re-sync shadow from canonical state
-        self.sync_shadow();
+        // Reset turn context for new round
+        self.reset_turn();
 
         let info = json!({
             "round": self.state.shop.round,
@@ -307,7 +254,7 @@ impl GameSession {
     /// Get board as opponent JSON for pool storage (includes perm stats).
     fn get_board_as_opponent(&self) -> String {
         let mut entries = Vec::new();
-        for (slot, unit) in self.shadow_board.iter().enumerate() {
+        for (slot, unit) in self.state.shop.board.iter().enumerate() {
             if let Some(bu) = unit {
                 let mut entry = json!({"card_id": bu.card_id.0, "slot": slot});
                 if bu.perm_attack != 0 {
@@ -322,14 +269,14 @@ impl GameSession {
         serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into())
     }
 
-    /// Get (round, lives, wins) tuple for info dict.
+    /// Get (round, lives, wins) tuple.
     fn get_info(&self) -> (i32, i32, i32) {
         (self.state.shop.round, self.state.lives, self.state.wins)
     }
 
     /// Get hand card names (for evaluate.py card tracking).
     fn get_hand_names(&self) -> Vec<Option<String>> {
-        self.shadow_hand
+        self.hand_view()
             .iter()
             .map(|slot| {
                 slot.and_then(|cid| {
@@ -345,7 +292,9 @@ impl GameSession {
 
     /// Get board card names (for evaluate.py card tracking).
     fn get_board_names(&self) -> Vec<Option<String>> {
-        self.shadow_board
+        self.state
+            .shop
+            .board
             .iter()
             .map(|slot| {
                 slot.as_ref().and_then(|bu| {
@@ -359,9 +308,8 @@ impl GameSession {
             .collect()
     }
 
-    /// Number of pending actions this turn.
     fn pending_action_count(&self) -> usize {
-        self.pending_actions.len()
+        self.action_count
     }
 
     /// Observation vector dimension (depends on the card set).
@@ -377,7 +325,6 @@ impl GameSession {
 
     // ── Legacy JSON API (for play.py and debugging) ──
 
-    /// Reset the game with a new seed. Returns state JSON.
     fn reset(&mut self, seed: u64, set_id: Option<u32>) -> PyResult<String> {
         if let Some(set_id) = set_id {
             *self = GameSession::new(seed, set_id)?;
@@ -396,17 +343,15 @@ impl GameSession {
             self.state.lives = self.state.config.starting_lives;
             self.state.draw_hand(hand_size);
             apply_shop_start_triggers(&mut self.state.shop);
-            self.sync_shadow();
+            self.reset_turn();
         }
         Ok(self.state_json())
     }
 
-    /// Get current game state as JSON.
     fn get_state(&self) -> String {
         self.state_json()
     }
 
-    /// Get all cards in the card pool as JSON.
     fn get_cards(&self) -> String {
         let cards: Vec<CardView> = self
             .state
@@ -418,7 +363,6 @@ impl GameSession {
         serde_json::to_string(&cards).unwrap_or_else(|_| "[]".into())
     }
 
-    /// Apply shop actions via JSON. Returns state JSON.
     fn shop(&mut self, actions_json: &str) -> PyResult<String> {
         if self.state.phase == GamePhase::Completed {
             return Err(PyRuntimeError::new_err("Game is already over."));
@@ -439,12 +383,11 @@ impl GameSession {
 
         self.state.shop.shop_mana = 0;
         self.state.phase = GamePhase::Battle;
-        self.sync_shadow();
+        self.reset_turn();
 
         Ok(self.state_json())
     }
 
-    /// Run battle via JSON. Returns step result JSON.
     fn battle(&mut self, opponent_json: &str) -> PyResult<String> {
         if self.state.phase == GamePhase::Completed {
             return Err(PyRuntimeError::new_err("Game is already over."));
@@ -490,7 +433,7 @@ impl GameSession {
             None
         };
 
-        self.sync_shadow();
+        self.reset_turn();
 
         let reward = match &outcome.result {
             BattleResult::Victory => 1,

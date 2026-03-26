@@ -161,8 +161,9 @@ fn handle_reset(request: &mut Request, backend: &Mutex<Backend>) -> Result<Strin
         Backend::Local(local) => {
             let set_id = req.set_id.unwrap_or(local.default_set_id);
             let session = GameSession::new(seed, set_id).map_err(|e| (400, e))?;
-            local.sessions.insert(req.agent_id, session);
-            let session = local.sessions.values().last().unwrap();
+            let agent_id = req.agent_id;
+            local.sessions.insert(agent_id.clone(), session);
+            let session = local.sessions.get(&agent_id).unwrap();
             session.get_state()
         }
         #[cfg(feature = "chain")]

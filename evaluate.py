@@ -60,13 +60,11 @@ def run_evaluation(model, set_id, num_games, shared_pool=False):
         total_reward = 0
         steps = 0
         cards_played_this_game = set()
-        cards_seen_this_game = set()
 
-        # Record initial hand
+        # Record initial hand (count every instance, not unique per game)
         for name in env.get_hand_names():
             if name is not None:
                 card_stats[name]["seen"] += 1
-                cards_seen_this_game.add(name)
 
         while True:
             masks = env.action_masks()
@@ -90,12 +88,11 @@ def run_evaluation(model, set_id, num_games, shared_pool=False):
             total_reward += reward
             steps += 1
 
-            # After EndTurn, record new hand cards
+            # After EndTurn, record new hand cards (every instance)
             if action_type == "EndTurn" and not terminated:
                 for name in env.get_hand_names():
-                    if name is not None and name not in cards_seen_this_game:
+                    if name is not None:
                         card_stats[name]["seen"] += 1
-                        cards_seen_this_game.add(name)
 
             if terminated or truncated:
                 game_result = info.get("game_result", "unknown")

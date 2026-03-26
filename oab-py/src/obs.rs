@@ -368,6 +368,16 @@ fn norm(value: f32, max_val: f32) -> f32 {
     }
 }
 
+/// Signed normalization for position indices that can be negative.
+/// Maps [-max, +max] to [0, 1]. index=-1 and index=0 are distinguishable.
+fn signed_norm(value: f32, max_val: f32) -> f32 {
+    if max_val > 0.0 {
+        ((value / max_val) + 1.0) / 2.0
+    } else {
+        0.5
+    }
+}
+
 // ── Battle Matcher Encoding ──
 
 fn encode_battle_matcher(matcher: &Matcher, c: &ObsConstants, out: &mut [f32]) {
@@ -409,7 +419,7 @@ fn encode_battle_matcher(matcher: &Matcher, c: &ObsConstants, out: &mut [f32]) {
         Matcher::IsPosition { scope, index } => {
             out[4] = 1.0;
             out[NUM_BATTLE_MATCHERS + scope_index(scope)] = 1.0;
-            out[BATTLE_MATCHER_FEATURES - 1] = norm(*index as f32, c.max_position_index);
+            out[BATTLE_MATCHER_FEATURES - 1] = signed_norm(*index as f32, c.max_position_index);
         }
     }
 }
@@ -434,7 +444,7 @@ fn encode_shop_matcher(matcher: &ShopMatcher, c: &ObsConstants, out: &mut [f32])
         ShopMatcher::IsPosition { scope, index } => {
             out[2] = 1.0;
             out[NUM_SHOP_MATCHERS + shop_scope_index(scope)] = 1.0;
-            out[SHOP_MATCHER_FEATURES - 1] = norm(*index as f32, c.max_position_index);
+            out[SHOP_MATCHER_FEATURES - 1] = signed_norm(*index as f32, c.max_position_index);
         }
     }
 }
@@ -659,7 +669,7 @@ fn fill_battle_target(
     order: &mut [f32; NUM_SORT_ORDERS], pos: &mut f32,
 ) {
     match target {
-        AbilityTarget::Position { scope: s, index: i } => { scope[scope_index(s)] = 1.0; mode[0] = 1.0; *pos = norm(*i as f32, c.max_position_index); }
+        AbilityTarget::Position { scope: s, index: i } => { scope[scope_index(s)] = 1.0; mode[0] = 1.0; *pos = signed_norm(*i as f32, c.max_position_index); }
         AbilityTarget::Adjacent { scope: s } => { scope[scope_index(s)] = 1.0; mode[1] = 1.0; }
         AbilityTarget::Random { scope: s, count: n } => { scope[scope_index(s)] = 1.0; mode[2] = 1.0; *count = norm(*n as f32, c.max_target_count); }
         AbilityTarget::Standard { scope: s, stat: st, order: o, count: n } => { scope[scope_index(s)] = 1.0; mode[3] = 1.0; *count = norm(*n as f32, c.max_target_count); stat[stat_type_index(st)] = 1.0; order[sort_order_index(o)] = 1.0; }
@@ -691,7 +701,7 @@ fn fill_shop_target(
     order: &mut [f32; NUM_SORT_ORDERS], pos: &mut f32,
 ) {
     match target {
-        ShopTarget::Position { scope: s, index: i } => { scope[shop_scope_index(s)] = 1.0; mode[0] = 1.0; *pos = norm(*i as f32, c.max_position_index); }
+        ShopTarget::Position { scope: s, index: i } => { scope[shop_scope_index(s)] = 1.0; mode[0] = 1.0; *pos = signed_norm(*i as f32, c.max_position_index); }
         ShopTarget::Random { scope: s, count: n } => { scope[shop_scope_index(s)] = 1.0; mode[1] = 1.0; *count = norm(*n as f32, c.max_target_count); }
         ShopTarget::Standard { scope: s, stat: st, order: o, count: n } => { scope[shop_scope_index(s)] = 1.0; mode[2] = 1.0; *count = norm(*n as f32, c.max_target_count); stat[stat_type_index(st)] = 1.0; order[sort_order_index(o)] = 1.0; }
         ShopTarget::All { scope: s } => { scope[shop_scope_index(s)] = 1.0; mode[3] = 1.0; }
