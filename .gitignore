@@ -9,7 +9,7 @@ build/
 .venv/
 
 # Rust / PyO3 build
-pylib/target/
+oab-py/target/
 server/target/
 *.so
 *.dylib
@@ -32,6 +32,10 @@ scripts/__pycache__/
 
 # Cargo local config (developer overrides)
 .cargo/config.toml
+
+# Pytest
+pytest-of-*/
+.pytest_cache/
 
 # macOS
 .DS_Store
