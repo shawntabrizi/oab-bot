@@ -5,7 +5,10 @@
 
 use oab_battle::types::*;
 
-use super::obs::{BOARD_SIZE, HAND_SIZE};
+// Hand and board sizes are fixed by the game rules (5 each).
+// These match GameConfig defaults and the action table layout.
+const HAND_SIZE: usize = 5;
+const BOARD_SIZE: usize = 5;
 
 pub const NUM_ACTIONS: usize = 66;
 

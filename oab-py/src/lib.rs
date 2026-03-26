@@ -31,6 +31,7 @@ const DEFAULT_MAX_ACTIONS_PER_TURN: usize = 15;
 struct GameSession {
     state: oab_game::GameState,
     card_set: oab_battle::state::CardSet,
+    obs_constants: obs::ObsConstants,
     // Shadow state for local action tracking (avoids JSON round-trips)
     shadow_hand: Vec<Option<CardId>>,
     shadow_board: Vec<Option<BoardUnit>>,
@@ -43,11 +44,11 @@ impl GameSession {
     /// Sync shadow state from the canonical game state.
     fn sync_shadow(&mut self) {
         self.shadow_hand = self.state.shop.hand.iter().map(|cid| Some(*cid)).collect();
-        while self.shadow_hand.len() < obs::HAND_SIZE {
+        while self.shadow_hand.len() < self.obs_constants.hand_size {
             self.shadow_hand.push(None);
         }
         self.shadow_board = self.state.shop.board.clone();
-        while self.shadow_board.len() < obs::BOARD_SIZE {
+        while self.shadow_board.len() < self.obs_constants.board_size {
             self.shadow_board.push(None);
         }
         self.shadow_mana = self.state.shop.shop_mana;
@@ -82,9 +83,16 @@ impl GameSession {
         state.draw_hand(hand_size);
         apply_shop_start_triggers(&mut state.shop);
 
+        let obs_constants = obs::ObsConstants::from_card_set(
+            &state.shop.card_pool,
+            &card_set,
+            &state.config,
+        );
+
         let mut session = Self {
             state,
             card_set,
+            obs_constants,
             shadow_hand: Vec::new(),
             shadow_board: Vec::new(),
             shadow_mana: 0,
@@ -104,6 +112,7 @@ impl GameSession {
             &self.shadow_board,
             self.shadow_mana,
             &self.state,
+            &self.obs_constants,
         )
     }
 
@@ -355,10 +364,9 @@ impl GameSession {
         self.pending_actions.len()
     }
 
-    /// Observation vector dimension.
-    #[staticmethod]
-    fn obs_dim() -> usize {
-        obs::OBS_DIM
+    /// Observation vector dimension (depends on the card set).
+    fn obs_dim(&self) -> usize {
+        self.obs_constants.obs_dim
     }
 
     /// Number of discrete actions.

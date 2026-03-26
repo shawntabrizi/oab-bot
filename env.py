@@ -33,9 +33,11 @@ class OABEnv(gym.Env):
         self.action_cost = action_cost
         self.repeat_penalty = repeat_penalty
 
+        # Create a temporary session to get dynamic obs_dim for this card set
+        probe = oab_py.GameSession(0, set_id)
         self.observation_space = spaces.Box(
             low=0.0, high=1.0,
-            shape=(oab_py.GameSession.obs_dim(),), dtype=np.float32
+            shape=(probe.obs_dim(),), dtype=np.float32
         )
         self.action_space = spaces.Discrete(oab_py.GameSession.num_actions())
 
