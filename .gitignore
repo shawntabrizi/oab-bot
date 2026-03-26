@@ -10,6 +10,7 @@ build/
 
 # Rust / PyO3 build
 pylib/target/
+server/target/
 *.so
 *.dylib
 
@@ -19,8 +20,15 @@ logs/
 
 # Server logs
 *.log
+.server.log
+
+# Scripts artifacts
+scripts/__pycache__/
 
 # IDE
 .idea/
 .vscode/
 *.swp
+
+# macOS
+.DS_Store

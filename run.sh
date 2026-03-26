@@ -13,7 +13,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SERVER_DIR="$(cd "$SCRIPT_DIR/../open-auto-battler" && pwd)"
+SERVER_DIR="$SCRIPT_DIR/server"
 SERVER_BIN="$SERVER_DIR/target/debug/oab-server"
 
 # ── Defaults ──
@@ -67,7 +67,7 @@ trap cleanup EXIT
 # ── Build server if needed ──
 if [[ ! -f "$SERVER_BIN" ]]; then
     echo "Building oab-server..."
-    (cd "$SERVER_DIR" && cargo build -p oab-server)
+    (cd "$SERVER_DIR" && cargo build)
 fi
 
 # ── Fund account ──

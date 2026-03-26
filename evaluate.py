@@ -16,11 +16,7 @@ from collections import defaultdict
 import numpy as np
 from sb3_contrib import MaskablePPO
 
-from env import (
-    OABEnv, BoardPool,
-    ECONOMY_DONE, BURN_START, BURN_END, PLAY_START, PLAY_END,
-    SELL_START, SELL_END, ORDER_KEEP,
-)
+from env import OABEnv, BoardPool, ACTION_TABLE
 
 
 def run_evaluation(model, set_id, num_games):
@@ -56,14 +52,13 @@ def run_evaluation(model, set_id, num_games):
             action = int(action)
 
             # Track card-level actions before stepping
-            if BURN_START <= action <= BURN_END:
-                i = action - BURN_START
-                card = env._hand[i]
+            action_type, params = ACTION_TABLE[action]
+            if action_type == "BurnFromHand":
+                card = env._hand[params["hand_index"]]
                 if card:
                     card_stats[card["name"]]["burned"] += 1
-            elif PLAY_START <= action <= PLAY_END:
-                i = action - PLAY_START
-                card = env._hand[i]
+            elif action_type == "PlayFromHand":
+                card = env._hand[params["hand_index"]]
                 if card:
                     card_stats[card["name"]]["played"] += 1
                     cards_played_this_game.add(card["name"])
@@ -72,8 +67,8 @@ def run_evaluation(model, set_id, num_games):
             total_reward += reward
             steps += 1
 
-            # After ordering action (turn submitted), record new hand cards
-            if action >= ORDER_KEEP and not terminated:
+            # After EndTurn, record new hand cards
+            if action_type == "EndTurn" and not terminated:
                 for card in env._hand:
                     if card is not None:
                         cname = card["name"]

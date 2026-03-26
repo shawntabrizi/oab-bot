@@ -15,6 +15,9 @@ Usage:
 import argparse
 import os
 
+import torch
+torch.distributions.Distribution.set_default_validate_args(False)
+
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
