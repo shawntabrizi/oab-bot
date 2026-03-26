@@ -21,7 +21,7 @@ import numpy as np
 from sb3_contrib import MaskablePPO
 
 from env import OABEnv
-from oab_shared import ACTION_TABLE, BoardPool, MatchedPool
+from oab_shared import ACTION_TABLE, MatchedPool
 
 
 def wilson_ci(successes, total, z=1.96):
@@ -38,9 +38,9 @@ def wilson_ci(successes, total, z=1.96):
     return (max(0.0, center - spread) * 100, min(1.0, center + spread) * 100)
 
 
-def run_evaluation(model, set_id, num_games, shared_pool=False, matched=True):
+def run_evaluation(model, set_id, num_games, shared_pool=False):
     """Run games and collect statistics."""
-    pool = MatchedPool() if matched else BoardPool(max_size=200)
+    pool = MatchedPool()
 
     results = []
     card_stats = defaultdict(lambda: {
@@ -53,7 +53,7 @@ def run_evaluation(model, set_id, num_games, shared_pool=False, matched=True):
 
     for game in range(1, num_games + 1):
         if not shared_pool:
-            pool = BoardPool(max_size=200)
+            pool = MatchedPool()
         env = OABEnv(set_id=set_id, board_pool=pool)
 
         obs, info = env.reset()
@@ -63,10 +63,10 @@ def run_evaluation(model, set_id, num_games, shared_pool=False, matched=True):
         cards_seen_this_game = set()
 
         # Record initial hand
-        for card in env._hand:
-            if card is not None:
-                card_stats[card["name"]]["seen"] += 1
-                cards_seen_this_game.add(card["name"])
+        for name in env.get_hand_names():
+            if name is not None:
+                card_stats[name]["seen"] += 1
+                cards_seen_this_game.add(name)
 
         while True:
             masks = env.action_masks()
@@ -75,15 +75,16 @@ def run_evaluation(model, set_id, num_games, shared_pool=False, matched=True):
 
             # Track card-level actions before stepping
             action_type, params = ACTION_TABLE[action]
+            hand_names = env.get_hand_names()
             if action_type == "BurnFromHand":
-                card = env._hand[params["hand_index"]]
-                if card:
-                    card_stats[card["name"]]["burned"] += 1
+                name = hand_names[params["hand_index"]]
+                if name:
+                    card_stats[name]["burned"] += 1
             elif action_type == "PlayFromHand":
-                card = env._hand[params["hand_index"]]
-                if card:
-                    card_stats[card["name"]]["played"] += 1
-                    cards_played_this_game.add(card["name"])
+                name = hand_names[params["hand_index"]]
+                if name:
+                    card_stats[name]["played"] += 1
+                    cards_played_this_game.add(name)
 
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
@@ -91,12 +92,10 @@ def run_evaluation(model, set_id, num_games, shared_pool=False, matched=True):
 
             # After EndTurn, record new hand cards
             if action_type == "EndTurn" and not terminated:
-                for card in env._hand:
-                    if card is not None:
-                        cname = card["name"]
-                        if cname not in cards_seen_this_game:
-                            card_stats[cname]["seen"] += 1
-                            cards_seen_this_game.add(cname)
+                for name in env.get_hand_names():
+                    if name is not None and name not in cards_seen_this_game:
+                        card_stats[name]["seen"] += 1
+                        cards_seen_this_game.add(name)
 
             if terminated or truncated:
                 game_result = info.get("game_result", "unknown")

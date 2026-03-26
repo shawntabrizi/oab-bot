@@ -3,7 +3,7 @@
 
 Uses native PyO3 bindings — no game server needed.
 
-Runs a lobby of N agents that share a BoardPool. Each agent plays
+Runs a lobby of N agents that share a MatchedPool. Each agent plays
 independently but faces opponents drawn from the pool of boards
 produced by all agents across recent rounds.
 
@@ -25,7 +25,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 from config import TrainConfig, load_config, save_config
 from env import OABEnv
-from oab_shared import BoardPool, MatchedPool
+from oab_shared import MatchedPool
 
 
 def make_env(config, board_pool):
@@ -36,7 +36,6 @@ def make_env(config, board_pool):
             board_pool=board_pool,
             action_cost=config.action_cost,
             repeat_penalty=config.repeat_penalty,
-            max_actions_per_turn=config.max_actions_per_turn,
         )
     return _init
 
@@ -75,10 +74,7 @@ def main():
     os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
     os.makedirs(config.log_dir, exist_ok=True)
 
-    if config.matched_pool:
-        board_pool = MatchedPool(max_per_bucket=config.max_boards_per_bucket)
-    else:
-        board_pool = BoardPool(max_size=config.board_pool_size)
+    board_pool = MatchedPool(max_per_bucket=config.max_boards_per_bucket)
 
     env_fns = [make_env(config, board_pool) for _ in range(config.lobby_size)]
     vec_env = DummyVecEnv(env_fns)
@@ -98,6 +94,7 @@ def main():
             n_epochs=config.n_epochs,
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
+            policy_kwargs=dict(net_arch=[1024, 512]),
         )
 
     checkpoint_cb = CheckpointCallback(
@@ -111,8 +108,7 @@ def main():
     print(f"  Set: {config.set_id}")
     print(f"  LR: {config.learning_rate}, Batch: {config.batch_size}, Epochs: {config.n_epochs}")
     print(f"  Action cost: {config.action_cost}, Repeat penalty: {config.repeat_penalty}")
-    pool_type = "matched" if config.matched_pool else "flat"
-    print(f"  Pool: {pool_type}")
+    print(f"  Pool: matched (max {config.max_boards_per_bucket}/bucket)")
     print(f"  TensorBoard: tensorboard --logdir {config.log_dir}")
 
     model.learn(

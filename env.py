@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Gymnasium environment for Open Auto Battler with self-play support.
 
-Flat 66-action design with action masking. All action types available
-simultaneously. Small per-action cost discourages wasted actions.
-15-action safety limit prevents infinite loops.
-
-Uses native PyO3 bindings (oab_py) for direct game engine access.
+Thin wrapper around the Rust oab_py.GameSession which handles observation
+encoding, action masking, and state tracking natively. No JSON on the
+training hot path.
 """
 
 import json
@@ -15,35 +13,20 @@ import numpy as np
 from gymnasium import spaces
 
 import oab_py
-from oab_shared import (
-    OBS_DIM,
-    NUM_ACTIONS,
-    ACTION_TABLE,
-    DEFAULT_ACTION_COST,
-    DEFAULT_REPEAT_PENALTY,
-    DEFAULT_MAX_ACTIONS_PER_TURN,
-    GameStateTracker,
-    BoardPool,
-    MatchedPool,
-)
+from oab_shared import MatchedPool
 
-
-# ── Gymnasium Environment ──
 
 class OABEnv(gym.Env):
     """Open Auto Battler environment with self-play.
 
-    Flat 66-action space. All action types available simultaneously.
-    Action limit per turn forces EndTurn to prevent loops.
-    Small per-action cost and no-op penalty discourage wasted actions.
+    Uses Rust-side observation encoding and action masking for performance.
+    Python handles only the gym interface and opponent pool integration.
     """
 
     metadata = {"render_modes": []}
 
     def __init__(self, set_id=0, board_pool=None,
-                 action_cost=DEFAULT_ACTION_COST,
-                 repeat_penalty=DEFAULT_REPEAT_PENALTY,
-                 max_actions_per_turn=DEFAULT_MAX_ACTIONS_PER_TURN):
+                 action_cost=-0.01, repeat_penalty=-0.1):
         super().__init__()
         self.set_id = set_id
         self.board_pool = board_pool
@@ -51,111 +34,60 @@ class OABEnv(gym.Env):
         self.repeat_penalty = repeat_penalty
 
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
+            low=0.0, high=1.0,
+            shape=(oab_py.GameSession.obs_dim(),), dtype=np.float32
         )
-        self.action_space = spaces.Discrete(NUM_ACTIONS)
+        self.action_space = spaces.Discrete(oab_py.GameSession.num_actions())
 
-        self._tracker = GameStateTracker(max_actions_per_turn=max_actions_per_turn)
         self._session = None
-
-    # Expose tracker state for evaluate.py card tracking
-    @property
-    def _hand(self):
-        return self._tracker.hand
-
-    @property
-    def _board(self):
-        return self._tracker.board
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         game_seed = int(self.np_random.integers(0, 2**32))
         self._session = oab_py.GameSession(game_seed, self.set_id)
-        state = json.loads(self._session.get_state())
-        self._tracker.sync(state)
-        return self._tracker.encode_obs(), self._make_info()
+        obs = np.array(self._session.get_observation(), dtype=np.float32)
+        return obs, self._make_info()
 
     def step(self, action):
-        action_type, params = ACTION_TABLE[int(action)]
+        action = int(action)
 
-        if action_type == "EndTurn":
+        if action == 0:  # EndTurn
             return self._do_end_turn()
 
-        # Snapshot board before action (for no-op detection)
-        board_before = [id(u) for u in self._tracker.board]
+        # Apply action locally in Rust
+        changed = self._session.apply_action(action)
+        reward = self.action_cost if changed else self.repeat_penalty
 
-        self._tracker.pending_actions.append((action_type, params))
-        self._tracker.apply_action(action_type, params)
-
-        # Determine action reward
-        board_after = [id(u) for u in self._tracker.board]
-        if action_type in ("SwapBoard", "MoveBoard") and board_before == board_after:
-            reward = self.repeat_penalty
-        else:
-            reward = self.action_cost
-
-        return self._tracker.encode_obs(), reward, False, False, self._make_info()
+        obs = np.array(self._session.get_observation(), dtype=np.float32)
+        return obs, reward, False, False, self._make_info()
 
     def action_masks(self):
-        return self._tracker.action_masks()
+        return np.array(self._session.get_action_mask(), dtype=bool)
 
-    # ── Turn Submission ──
+    # Expose card names for evaluate.py
+    def get_hand_names(self):
+        return self._session.get_hand_names()
+
+    def get_board_names(self):
+        return self._session.get_board_names()
 
     def _do_end_turn(self):
-        server_actions = []
-        for action_type, params in self._tracker.pending_actions:
-            action = {"type": action_type}
-            action.update(params)
-            server_actions.append(action)
+        rnd, lives, wins = self._session.get_info()
+        board = json.loads(self._session.get_board_as_opponent())
 
-        actions_json = json.dumps(server_actions)
-
-        try:
-            shop_result = json.loads(self._session.shop(actions_json))
-        except Exception:
-            try:
-                shop_result = json.loads(self._session.shop("[]"))
-            except Exception as e:
-                return self._tracker.encode_obs(), -1.0, True, False, {
-                    "error": str(e), **self._make_info()
-                }
-
-        state = shop_result
-        self._tracker.sync(state)
-
-        my_board = self._tracker.get_board_as_opponent()
-        round_num = self._tracker.state["round"]
-        wins = self._tracker.state["wins"]
-        lives = self._tracker.state["lives"]
         if self.board_pool is not None:
-            self.board_pool.add(round_num, wins, lives, my_board)
-            opponent = self.board_pool.sample(round_num, wins, lives)
+            self.board_pool.add(rnd, wins, lives, board)
+            opponent = self.board_pool.sample(rnd, wins, lives)
+            opponent_json = json.dumps(opponent)
         else:
-            opponent = []
+            opponent_json = "[]"
 
-        opponent_json = json.dumps(opponent)
+        reward, terminated, info_json = self._session.commit_turn_and_battle(opponent_json)
+        obs = np.array(self._session.get_observation(), dtype=np.float32)
+        info = json.loads(info_json)
 
-        try:
-            result = json.loads(self._session.battle(opponent_json))
-        except Exception as e:
-            return self._tracker.encode_obs(), -1.0, True, False, {
-                "error": str(e), **self._make_info()
-            }
-
-        reward = float(result["reward"])
-        terminated = result["game_over"]
-
-        self._tracker.sync(result["state"])
-
-        info = self._make_info()
-        info["battle_result"] = result["battle_result"]
-        if terminated:
-            info["game_result"] = result.get("game_result")
-
-        return self._tracker.encode_obs(), reward, terminated, False, info
-
-    # ── Info ──
+        return obs, reward, terminated, False, info
 
     def _make_info(self):
-        s = self._tracker.state
-        return {"round": s["round"], "lives": s["lives"], "wins": s["wins"]}
+        rnd, lives, wins = self._session.get_info()
+        return {"round": rnd, "lives": lives, "wins": wins}

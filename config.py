@@ -24,12 +24,9 @@ class TrainConfig:
     # Reward shaping
     action_cost: float = -0.01
     repeat_penalty: float = -0.1
-    max_actions_per_turn: int = 15
 
     # Self-play
     lobby_size: int = 10
-    board_pool_size: int = 200
-    matched_pool: bool = True
     max_boards_per_bucket: int = 50
 
     # Training run
