@@ -9,7 +9,8 @@ produced by all agents across recent rounds.
 
 Usage:
     python train.py
-    python train.py --lobby-size 10 --timesteps 5000000
+    python train.py --config experiment.json
+    python train.py --timesteps 5000000
 """
 
 import argparse
@@ -22,38 +23,60 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+from config import TrainConfig, load_config, save_config
 from env import OABEnv, BoardPool
 
 
-def make_env(set_id, board_pool):
-    """Factory for creating an OABEnv with shared board pool."""
+def make_env(config, board_pool):
+    """Factory for creating an OABEnv with shared board pool and config."""
     def _init():
-        return OABEnv(set_id=set_id, board_pool=board_pool)
+        return OABEnv(
+            set_id=config.set_id,
+            board_pool=board_pool,
+            action_cost=config.action_cost,
+            repeat_penalty=config.repeat_penalty,
+            max_actions_per_turn=config.max_actions_per_turn,
+        )
     return _init
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train OAB RL agent with self-play")
-    parser.add_argument("--set-id", type=int, default=0,
+    parser.add_argument("--config", default=None,
+                        help="Path to JSON config file (overrides defaults)")
+    parser.add_argument("--set-id", type=int, default=None,
                         help="Card set ID to train on")
-    parser.add_argument("--lobby-size", type=int, default=10,
+    parser.add_argument("--lobby-size", type=int, default=None,
                         help="Number of agents in self-play lobby")
-    parser.add_argument("--timesteps", type=int, default=500_000,
+    parser.add_argument("--timesteps", type=int, default=None,
                         help="Total training timesteps")
-    parser.add_argument("--save-path", default="models/oab_agent",
+    parser.add_argument("--save-path", default=None,
                         help="Path to save trained model (without .zip)")
-    parser.add_argument("--log-dir", default="logs",
+    parser.add_argument("--log-dir", default=None,
                         help="TensorBoard log directory")
     parser.add_argument("--resume", default=None,
                         help="Path to model to resume training from")
     args = parser.parse_args()
 
-    os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
+    # Load config from file, then override with CLI args
+    config = load_config(args.config)
+    if args.set_id is not None:
+        config.set_id = args.set_id
+    if args.lobby_size is not None:
+        config.lobby_size = args.lobby_size
+    if args.timesteps is not None:
+        config.timesteps = args.timesteps
+    if args.save_path is not None:
+        config.save_path = args.save_path
+    if args.log_dir is not None:
+        config.log_dir = args.log_dir
 
-    board_pool = BoardPool(max_size=200)
+    os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
+    os.makedirs(config.log_dir, exist_ok=True)
 
-    env_fns = [make_env(args.set_id, board_pool) for _ in range(args.lobby_size)]
+    board_pool = BoardPool(max_size=config.board_pool_size)
+
+    env_fns = [make_env(config, board_pool) for _ in range(config.lobby_size)]
     vec_env = DummyVecEnv(env_fns)
 
     if args.resume:
@@ -64,34 +87,39 @@ def main():
             "MlpPolicy",
             vec_env,
             verbose=1,
-            tensorboard_log=args.log_dir,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
+            tensorboard_log=config.log_dir,
+            learning_rate=config.learning_rate,
+            n_steps=config.n_steps,
+            batch_size=config.batch_size,
+            n_epochs=config.n_epochs,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
         )
 
     checkpoint_cb = CheckpointCallback(
         save_freq=50_000,
-        save_path=os.path.dirname(args.save_path) or "models",
+        save_path=os.path.dirname(config.save_path) or "models",
         name_prefix="oab_checkpoint",
     )
 
-    print(f"Training with {args.lobby_size}-agent self-play lobby (native engine)")
-    print(f"  Timesteps: {args.timesteps}")
-    print(f"  Set: {args.set_id}")
-    print(f"  TensorBoard: tensorboard --logdir {args.log_dir}")
+    print(f"Training with {config.lobby_size}-agent self-play lobby (native engine)")
+    print(f"  Timesteps: {config.timesteps}")
+    print(f"  Set: {config.set_id}")
+    print(f"  LR: {config.learning_rate}, Batch: {config.batch_size}, Epochs: {config.n_epochs}")
+    print(f"  Action cost: {config.action_cost}, Repeat penalty: {config.repeat_penalty}")
+    print(f"  TensorBoard: tensorboard --logdir {config.log_dir}")
 
     model.learn(
-        total_timesteps=args.timesteps,
+        total_timesteps=config.timesteps,
         callback=checkpoint_cb,
         progress_bar=True,
     )
 
-    model.save(args.save_path)
-    print(f"Model saved to {args.save_path}.zip")
+    model.save(config.save_path)
+    config_path = f"{config.save_path}_config.json"
+    save_config(config, config_path)
+    print(f"Model saved to {config.save_path}.zip")
+    print(f"Config saved to {config_path}")
 
 
 if __name__ == "__main__":

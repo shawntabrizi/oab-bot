@@ -17,80 +17,19 @@ Usage:
 """
 
 import argparse
-import json
-import sys
 import time
-from itertools import combinations
 
 import numpy as np
 import requests
 from sb3_contrib import MaskablePPO
 
-# ── Game Constants (must match env.py / core) ──
-
-HAND_SIZE = 5
-BOARD_SIZE = 5
-
-MAX_ATTACK = 15.0
-MAX_HEALTH = 20.0
-MAX_COST = 10.0
-MAX_BURN = 5.0
-MAX_MANA = 10.0
-MAX_ROUND = 20.0
-MAX_LIVES = 3.0
-MAX_WINS = 10.0
-MAX_BAG = 50.0
-MAX_CARD_ID = 100.0
-MAX_ABILITIES = 5.0
-
-HAND_FEATURES = 9
-BOARD_FEATURES = 8
-SCALAR_FEATURES = 6
-OBS_DIM = HAND_SIZE * HAND_FEATURES + BOARD_SIZE * BOARD_FEATURES + SCALAR_FEATURES
-
-
-# ── Action Table (must match env.py) ──
-
-def _build_action_table():
-    actions = []
-    actions.append(("EndTurn", {}))
-    for i in range(HAND_SIZE):
-        actions.append(("BurnFromHand", {"hand_index": i}))
-    for hi in range(HAND_SIZE):
-        for bs in range(BOARD_SIZE):
-            actions.append(("PlayFromHand", {"hand_index": hi, "board_slot": bs}))
-    for bs in range(BOARD_SIZE):
-        actions.append(("BurnFromBoard", {"board_slot": bs}))
-    for a, b in combinations(range(BOARD_SIZE), 2):
-        actions.append(("SwapBoard", {"slot_a": a, "slot_b": b}))
-    for f in range(BOARD_SIZE):
-        for t in range(BOARD_SIZE):
-            if f != t:
-                actions.append(("MoveBoard", {"from_slot": f, "to_slot": t}))
-    return actions
-
-
-ACTION_TABLE = _build_action_table()
-NUM_ACTIONS = len(ACTION_TABLE)  # 66
-
-
-# ── Helpers ──
-
-def _norm(value, max_val):
-    return min(float(value) / max_val, 1.0) if max_val > 0 else 0.0
-
-
-def _norm_id(card_id):
-    if isinstance(card_id, dict):
-        card_id = next(iter(card_id.values()), 0)
-    return min(float(card_id) / MAX_CARD_ID, 1.0)
-
-
-def _extract_card_id(unit):
-    cid = unit.get("id", 0)
-    if isinstance(cid, dict):
-        cid = next(iter(cid.values()), 0)
-    return int(cid)
+from oab_shared import (
+    HAND_SIZE,
+    BOARD_SIZE,
+    ACTION_TABLE,
+    GameStateTracker,
+    extract_card_id,
+)
 
 
 # ── Server Client ──
@@ -142,154 +81,13 @@ class OABClient:
         return resp.json()
 
 
-# ── Game State Tracker ──
-
-class GameStateTracker:
-    """Tracks local game state for observation encoding and action masking.
-
-    Mirrors the local state tracking in env.py so the model sees the same
-    observations it was trained on.
-    """
-
-    MAX_ACTIONS_PER_TURN = 15
-
-    def __init__(self):
-        self.hand = [None] * HAND_SIZE
-        self.board = [None] * BOARD_SIZE
-        self.actions_this_turn = 0
-        self.mana = 0
-        self.mana_limit = 0
-        self.state = None
-
-    def sync(self, state):
-        """Sync from a server state response."""
-        self.state = state
-        self.hand = list(state["hand"])
-        self.board = list(state["board"])
-        while len(self.hand) < HAND_SIZE:
-            self.hand.append(None)
-        while len(self.board) < BOARD_SIZE:
-            self.board.append(None)
-        self.mana = state["mana"]
-        self.mana_limit = state["mana_limit"]
-        self.actions_this_turn = 0
-
-    def apply_action(self, action_type, params):
-        """Apply an action locally (before sending to server)."""
-        if action_type == "BurnFromHand":
-            i = params["hand_index"]
-            card = self.hand[i]
-            if card:
-                self.mana = min(self.mana + card["burn_value"], self.mana_limit)
-                self.hand[i] = None
-        elif action_type == "PlayFromHand":
-            i, j = params["hand_index"], params["board_slot"]
-            card = self.hand[i]
-            if card:
-                self.mana -= card["play_cost"]
-                self.board[j] = card
-                self.hand[i] = None
-        elif action_type == "BurnFromBoard":
-            j = params["board_slot"]
-            unit = self.board[j]
-            if unit:
-                self.mana = min(self.mana + unit["burn_value"], self.mana_limit)
-                self.board[j] = None
-        elif action_type == "SwapBoard":
-            a, b = params["slot_a"], params["slot_b"]
-            self.board[a], self.board[b] = self.board[b], self.board[a]
-        elif action_type == "MoveBoard":
-            f, t = params["from_slot"], params["to_slot"]
-            unit = self.board[f]
-            if f < t:
-                for k in range(f, t):
-                    self.board[k] = self.board[k + 1]
-            else:
-                for k in range(f, t, -1):
-                    self.board[k] = self.board[k - 1]
-            self.board[t] = unit
-
-    def encode_obs(self):
-        """Encode current state as observation vector (matches env.py)."""
-        obs = np.zeros(OBS_DIM, dtype=np.float32)
-        idx = 0
-
-        for i in range(HAND_SIZE):
-            card = self.hand[i]
-            if card is not None:
-                obs[idx + 0] = 1.0
-                obs[idx + 1] = _norm_id(card.get("id", 0))
-                obs[idx + 2] = _norm(card["attack"], MAX_ATTACK)
-                obs[idx + 3] = _norm(card["health"], MAX_HEALTH)
-                obs[idx + 4] = _norm(card["play_cost"], MAX_COST)
-                obs[idx + 5] = _norm(card["burn_value"], MAX_BURN)
-                obs[idx + 6] = 1.0 if self.mana >= card["play_cost"] else 0.0
-                obs[idx + 7] = _norm(len(card.get("battle_abilities", [])), MAX_ABILITIES)
-                obs[idx + 8] = _norm(len(card.get("shop_abilities", [])), MAX_ABILITIES)
-            idx += HAND_FEATURES
-
-        for i in range(BOARD_SIZE):
-            unit = self.board[i]
-            if unit is not None:
-                obs[idx + 0] = 1.0
-                obs[idx + 1] = _norm_id(unit.get("id", 0))
-                obs[idx + 2] = _norm(unit["attack"], MAX_ATTACK)
-                obs[idx + 3] = _norm(unit["health"], MAX_HEALTH)
-                obs[idx + 4] = _norm(unit["play_cost"], MAX_COST)
-                obs[idx + 5] = _norm(unit["burn_value"], MAX_BURN)
-                obs[idx + 6] = _norm(len(unit.get("battle_abilities", [])), MAX_ABILITIES)
-                obs[idx + 7] = _norm(len(unit.get("shop_abilities", [])), MAX_ABILITIES)
-            idx += BOARD_FEATURES
-
-        s = self.state
-        obs[idx + 0] = _norm(self.mana, MAX_MANA)
-        obs[idx + 1] = _norm(self.mana_limit, MAX_MANA)
-        obs[idx + 2] = _norm(s["round"], MAX_ROUND)
-        obs[idx + 3] = _norm(s["lives"], MAX_LIVES)
-        obs[idx + 4] = _norm(s["wins"], MAX_WINS)
-        obs[idx + 5] = _norm(s["bag_count"], MAX_BAG)
-
-        return obs
-
-    def action_masks(self):
-        """Compute valid action mask (matches env.py)."""
-        if self.actions_this_turn >= self.MAX_ACTIONS_PER_TURN:
-            mask = np.zeros(NUM_ACTIONS, dtype=bool)
-            mask[0] = True  # Force EndTurn
-            return mask
-
-        mask = np.zeros(NUM_ACTIONS, dtype=bool)
-        for i, (action_type, params) in enumerate(ACTION_TABLE):
-            mask[i] = self._is_valid(action_type, params)
-        return mask
-
-    def _is_valid(self, action_type, params):
-        if action_type == "EndTurn":
-            return True
-        if action_type == "BurnFromHand":
-            return self.hand[params["hand_index"]] is not None
-        if action_type == "PlayFromHand":
-            i, j = params["hand_index"], params["board_slot"]
-            card = self.hand[i]
-            return card is not None and self.board[j] is None and self.mana >= card["play_cost"]
-        if action_type == "BurnFromBoard":
-            return self.board[params["board_slot"]] is not None
-        if action_type == "SwapBoard":
-            a, b = params["slot_a"], params["slot_b"]
-            return self.board[a] is not None and self.board[b] is not None
-        if action_type == "MoveBoard":
-            f, t = params["from_slot"], params["to_slot"]
-            return self.board[f] is not None and self.board[t] is not None
-        return False
-
-
 # ── Display Helpers ──
 
 def _card_name(card):
     """Get a display name for a card/unit dict."""
     if card is None:
         return "---"
-    return card.get("name", f"#{_extract_card_id(card)}")
+    return card.get("name", f"#{extract_card_id(card)}")
 
 
 def _card_line(slot, card):
@@ -356,7 +154,6 @@ def play_game(model, client, tracker, game_num, verbose=True):
     """Play a single game, returning the result dict."""
     state = client.reset(set_id=0)
     tracker.sync(state)
-    pending_actions = []
     action_log = []
     # Snapshot the starting state for display
     turn_start_hand = [c.copy() if c else None for c in tracker.hand]
@@ -413,7 +210,7 @@ def play_game(model, client, tracker, game_num, verbose=True):
 
             # Build server action list
             server_actions = []
-            for at, ap in pending_actions:
+            for at, ap in tracker.pending_actions:
                 a = {"type": at}
                 a.update(ap)
                 server_actions.append(a)
@@ -432,7 +229,6 @@ def play_game(model, client, tracker, game_num, verbose=True):
                     print(f"  Error: {e.response.text}")
                     return {"result": "error", "wins": 0, "reward": 0}
 
-            pending_actions = []
             action_log = []
 
             battle_result = result["battle_result"]
@@ -472,9 +268,8 @@ def play_game(model, client, tracker, game_num, verbose=True):
             # Log the action before applying it (so we see the card names)
             if verbose:
                 action_log.append(_format_action(action_type, params, tracker))
-            pending_actions.append((action_type, params))
+            tracker.pending_actions.append((action_type, params))
             tracker.apply_action(action_type, params)
-            tracker.actions_this_turn += 1
 
 
 def main():

@@ -6,116 +6,52 @@ mod http;
 mod local;
 mod types;
 
-use std::env;
 use std::process;
 
+use clap::Parser;
 use http::{Backend, LocalBackend};
 
+#[derive(Parser)]
+#[command(
+    name = "oab-server",
+    about = "HTTP game server for AI agents to play Open Auto Battler.\n\n\
+             Modes:\n  \
+             Local (default)  Caller provides opponent boards each round.\n  \
+             On-chain         Provide --url and --key to play on a live blockchain.\n\n\
+             Endpoints:\n  \
+             POST /reset   Start new game\n  \
+             POST /submit  Submit actions\n  \
+             GET  /state   Get current game state\n  \
+             GET  /cards   List all cards\n  \
+             GET  /sets    List available card sets"
+)]
 struct Args {
+    /// Server port
+    #[arg(short, long, default_value_t = 3000)]
     port: u16,
-    set_id: u32,
+
+    /// Default card set ID
+    #[arg(long, default_value_t = 0)]
+    set: u32,
+
+    /// Chain RPC endpoint (enables on-chain mode)
+    #[arg(long)]
     url: Option<String>,
+
+    /// Secret key/SURI for signing (or set OAB_SECRET_SEED env var)
+    #[arg(long, env = "OAB_SECRET_SEED")]
     key: Option<String>,
-    fund_targets: Vec<String>,
-}
 
-fn parse_args() -> Args {
-    let args: Vec<String> = env::args().collect();
-    let mut cli = Args {
-        port: 3000,
-        set_id: 0,
-        url: None,
-        key: None,
-        fund_targets: Vec::new(),
-    };
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" | "-p" => {
-                i += 1;
-                if i < args.len() {
-                    cli.port = args[i].parse().unwrap_or(3000);
-                }
-            }
-            "--set" => {
-                i += 1;
-                if i < args.len() {
-                    cli.set_id = args[i].parse().unwrap_or(0);
-                }
-            }
-            "--url" => {
-                i += 1;
-                if i < args.len() {
-                    cli.url = Some(args[i].clone());
-                }
-            }
-            "--key" => {
-                i += 1;
-                if i < args.len() {
-                    cli.key = Some(args[i].clone());
-                }
-            }
-            "--fund" => {
-                // Collect all remaining args as target SURIs
-                i += 1;
-                while i < args.len() {
-                    cli.fund_targets.push(args[i].clone());
-                    i += 1;
-                }
-            }
-            "--help" | "-h" => {
-                print_usage();
-                process::exit(0);
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                print_usage();
-                process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    if cli.key.is_none() {
-        cli.key = env::var("OAB_SECRET_SEED").ok();
-    }
-
-    cli
-}
-
-fn print_usage() {
-    eprintln!(
-        "Usage: oab-server [OPTIONS]
-
-HTTP game server for AI agents to play Open Auto Battler.
-
-Modes:
-  Local (default)  Caller provides opponent boards each round.
-  On-chain         Provide --url and --key to play on a live blockchain.
-
-Endpoints:
-  POST /reset   Start new game {{ \"seed\": N, \"set_id\": N }}
-  POST /submit  Submit actions {{ \"actions\": [...], \"opponent\": [...] }}
-  GET  /state   Get current game state
-  GET  /cards   List all cards
-  GET  /sets    List available card sets
-
-Options:
-  --port <N>        Server port (default: 3000)
-  --set <N>         Default card set ID (default: 0)
-  --url <WS_URL>    Chain RPC endpoint (enables on-chain mode)
-  --key <SURI>      Secret key/SURI for signing (or set OAB_SECRET_SEED)
-  --fund <SURI...>  Fund accounts via sudo and exit (--key must be sudo key)
-  --help            Print this help"
-    );
+    /// Fund accounts via sudo and exit (--key must be sudo key)
+    #[arg(long, num_args = 1..)]
+    fund: Vec<String>,
 }
 
 fn main() {
-    let args = parse_args();
+    let args = Args::parse();
 
     // Fund mode: fund target accounts and exit
-    if !args.fund_targets.is_empty() {
+    if !args.fund.is_empty() {
         #[cfg(feature = "chain")]
         {
             let url = args.url.as_deref().unwrap_or_else(|| {
@@ -126,8 +62,8 @@ fn main() {
                 eprintln!("Error: --key required for --fund mode (must be sudo key).");
                 process::exit(1);
             });
-            eprintln!("Funding {} accounts...", args.fund_targets.len());
-            if let Err(e) = chain::fund_accounts(url, key, &args.fund_targets) {
+            eprintln!("Funding {} accounts...", args.fund.len());
+            if let Err(e) = chain::fund_accounts(url, key, &args.fund) {
                 eprintln!("Error funding accounts: {}", e);
                 process::exit(1);
             }
@@ -154,7 +90,7 @@ fn main() {
             };
 
             eprintln!("Starting on-chain mode...");
-            match chain::ChainGameSession::new(url, &key, args.set_id) {
+            match chain::ChainGameSession::new(url, &key, args.set) {
                 Ok(session) => Backend::Chain(session),
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -172,8 +108,8 @@ fn main() {
         }
     } else {
         // Local mode — sessions created on demand via POST /reset
-        eprintln!("Starting local mode (default set={})...", args.set_id);
-        Backend::Local(LocalBackend::new(args.set_id))
+        eprintln!("Starting local mode (default set={})...", args.set);
+        Backend::Local(LocalBackend::new(args.set))
     };
 
     if let Err(e) = http::serve(args.port, backend) {

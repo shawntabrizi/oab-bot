@@ -15,14 +15,15 @@ default = ["chain"]
 chain = ["subxt", "subxt-signer", "tokio"]
 
 [dependencies]
-oab-battle = { path = "../../open-auto-battler/battle", features = ["std", "bounded"] }
-oab-assets = { path = "../../open-auto-battler/assets", features = ["std", "bounded"] }
-oab-game = { path = "../../open-auto-battler/game", features = ["std", "bounded"] }
+oab-battle = { path = "../deps/open-auto-battler/battle", features = ["std", "bounded"] }
+oab-assets = { path = "../deps/open-auto-battler/assets", features = ["std", "bounded"] }
+oab-game = { path = "../deps/open-auto-battler/game", features = ["std", "bounded"] }
 serde = { version = "1.0.214", features = ["derive", "std"] }
 serde_json = { version = "1.0.132", features = ["std"] }
 parity-scale-codec = { version = "3.7.4", features = ["std", "derive"] }
 bounded-collections = { version = "0.2.4", features = ["std"] }
 tiny_http = "0.12"
+clap = { version = "4", features = ["derive", "env"] }
 subxt = { version = "0.38", optional = true }
 subxt-signer = { version = "0.38", features = ["sr25519", "subxt"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }

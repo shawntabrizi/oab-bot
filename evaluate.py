@@ -8,21 +8,39 @@ per-card pick/play/burn rates for balance analysis.
 Usage:
     python evaluate.py
     python evaluate.py --model-path models/oab_agent_5m --num-games 100
+    python evaluate.py --num-games 200 --output results.json
 """
 
 import argparse
+import csv
+import json
+import math
 from collections import defaultdict
 
 import numpy as np
 from sb3_contrib import MaskablePPO
 
-from env import OABEnv, BoardPool, ACTION_TABLE
+from env import OABEnv, BoardPool
+from oab_shared import ACTION_TABLE
 
 
-def run_evaluation(model, set_id, num_games):
+def wilson_ci(successes, total, z=1.96):
+    """Wilson score 95% confidence interval for a proportion.
+
+    Returns (lower, upper) as percentages.
+    """
+    if total == 0:
+        return (0.0, 0.0)
+    p = successes / total
+    denom = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denom
+    spread = z * math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / denom
+    return (max(0.0, center - spread) * 100, min(1.0, center + spread) * 100)
+
+
+def run_evaluation(model, set_id, num_games, shared_pool=False):
     """Run games and collect statistics."""
-    board_pool = BoardPool(max_size=200)
-    env = OABEnv(set_id=set_id, board_pool=board_pool)
+    pool = BoardPool(max_size=200)
 
     results = []
     card_stats = defaultdict(lambda: {
@@ -34,6 +52,10 @@ def run_evaluation(model, set_id, num_games):
     })
 
     for game in range(1, num_games + 1):
+        if not shared_pool:
+            pool = BoardPool(max_size=200)
+        env = OABEnv(set_id=set_id, board_pool=pool)
+
         obs, info = env.reset()
         total_reward = 0
         steps = 0
@@ -110,29 +132,33 @@ def print_summary(results, card_stats, set_id):
 
     victories = sum(1 for r in results if r["result"] == "victory")
     defeats = sum(1 for r in results if r["result"] == "defeat")
-    avg_wins = np.mean([r["wins"] for r in results])
+    win_pcts = [r["wins"] for r in results]
+    avg_wins = np.mean(win_pcts)
+    sem_wins = np.std(win_pcts, ddof=1) / np.sqrt(num_games) if num_games > 1 else 0
     avg_reward = np.mean([r["reward"] for r in results])
     avg_steps = np.mean([r["steps"] for r in results])
 
-    print(f"\n{'=' * 50}")
-    print(f"  Evaluation Results (Set {set_id})")
-    print(f"{'=' * 50}")
-    print(f"  Games played:      {num_games}")
-    print(f"  Full victories:    {victories} ({100*victories/num_games:.1f}%)")
+    victory_lo, victory_hi = wilson_ci(victories, num_games)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Evaluation Results (Set {set_id}, {num_games} games)")
+    print(f"{'=' * 60}")
+    print(f"  Full victories:    {victories}/{num_games} ({100*victories/num_games:.1f}%)"
+          f"  95% CI: [{victory_lo:.1f}%, {victory_hi:.1f}%]")
     print(f"  Defeats:           {defeats} ({100*defeats/num_games:.1f}%)")
-    print(f"  Avg wins/game:     {avg_wins:.2f}")
+    print(f"  Avg wins/game:     {avg_wins:.2f} +/- {sem_wins:.2f}")
     print(f"  Avg reward/game:   {avg_reward:+.2f}")
     print(f"  Avg steps/game:    {avg_steps:.1f}")
 
     if card_stats:
-        print(f"\n{'=' * 50}")
+        print(f"\n{'=' * 60}")
         print(f"  Card Statistics")
-        print(f"{'=' * 50}")
+        print(f"{'=' * 60}")
         print(
             f"  {'Card':<20s} {'Seen':>5s} {'Play':>5s} {'Burn':>5s} "
-            f"{'Play%':>6s} {'WinRate':>8s}"
+            f"{'Play%':>6s} {'WinRate':>8s} {'WR 95% CI':>14s}"
         )
-        print(f"  {'-'*20} {'-'*5} {'-'*5} {'-'*5} {'-'*6} {'-'*8}")
+        print(f"  {'-'*20} {'-'*5} {'-'*5} {'-'*5} {'-'*6} {'-'*8} {'-'*14}")
 
         for name in sorted(card_stats.keys()):
             s = card_stats[name]
@@ -142,10 +168,48 @@ def print_summary(results, card_stats, set_id):
                 if s["games_played"] > 0
                 else 0
             )
+            wr_lo, wr_hi = wilson_ci(s["games_won"], s["games_played"])
+            ci_str = f"[{wr_lo:4.1f},{wr_hi:5.1f}]" if s["games_played"] > 0 else "       -"
             print(
                 f"  {name:<20s} {s['seen']:5d} {s['played']:5d} {s['burned']:5d} "
-                f"{play_pct:5.1f}% {win_rate:6.1f}%"
+                f"{play_pct:5.1f}% {win_rate:6.1f}%  {ci_str}"
             )
+
+
+def export_results(results, card_stats, output_path):
+    """Export results and card stats to JSON or CSV."""
+    data = {
+        "games": results,
+        "card_stats": card_stats,
+    }
+
+    if output_path.endswith(".json"):
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        print(f"\nExported to {output_path}")
+
+    elif output_path.endswith(".csv"):
+        # Write two CSVs: games and card stats
+        games_path = output_path
+        cards_path = output_path.replace(".csv", "_cards.csv")
+
+        with open(games_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["game", "result", "wins", "reward", "steps"])
+            writer.writeheader()
+            writer.writerows(results)
+
+        with open(cards_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["card", "seen", "played", "burned", "games_played", "games_won"])
+            for name in sorted(card_stats.keys()):
+                s = card_stats[name]
+                writer.writerow([name, s["seen"], s["played"], s["burned"],
+                                 s["games_played"], s["games_won"]])
+
+        print(f"\nExported to {games_path} and {cards_path}")
+    else:
+        print(f"\nUnknown output format: {output_path} (use .json or .csv)")
 
 
 def main():
@@ -156,13 +220,21 @@ def main():
                         help="Card set ID")
     parser.add_argument("--num-games", type=int, default=100,
                         help="Number of games to evaluate")
+    parser.add_argument("--shared-pool", action="store_true",
+                        help="Share board pool across games (default: fresh pool per game)")
+    parser.add_argument("--output", default=None,
+                        help="Export results to file (.json or .csv)")
     args = parser.parse_args()
 
     model = MaskablePPO.load(args.model_path)
 
     print(f"Evaluating {args.model_path} for {args.num_games} games on set {args.set_id}...")
-    results, card_stats = run_evaluation(model, args.set_id, args.num_games)
+    results, card_stats = run_evaluation(model, args.set_id, args.num_games,
+                                          shared_pool=args.shared_pool)
     print_summary(results, card_stats, args.set_id)
+
+    if args.output:
+        export_results(results, card_stats, args.output)
 
 
 if __name__ == "__main__":

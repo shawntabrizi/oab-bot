@@ -30,5 +30,8 @@ scripts/__pycache__/
 .vscode/
 *.swp
 
+# Cargo local config (developer overrides)
+.cargo/config.toml
+
 # macOS
 .DS_Store

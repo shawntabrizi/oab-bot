@@ -5,16 +5,16 @@
 
 use std::collections::BTreeMap;
 
-use oab_core::battle::{
+use oab_battle::battle::{
     player_permanent_stat_deltas_from_events, player_shop_mana_delta_from_events, resolve_battle,
     BattleResult, CombatEvent, CombatUnit, UnitId,
 };
-use oab_core::commit::{apply_shop_start_triggers, apply_shop_start_triggers_with_result};
-use oab_core::rng::XorShiftRng;
-use oab_core::state::*;
-use oab_core::types::*;
-use oab_core::units::create_starting_bag;
-use oab_core::view::GameView;
+use oab_battle::commit::{apply_shop_start_triggers, apply_shop_start_triggers_with_result};
+use oab_battle::rng::XorShiftRng;
+use oab_battle::types::*;
+use oab_game::sealed::{create_starting_bag, default_config};
+use oab_game::view::{CardView, GameView};
+use oab_game::GamePhase;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -23,8 +23,8 @@ use serde_json::json;
 /// A local game session exposed to Python.
 #[pyclass]
 struct GameSession {
-    state: GameState,
-    card_set: CardSet,
+    state: oab_game::GameState,
+    card_set: oab_battle::state::CardSet,
 }
 
 #[pymethods]
@@ -32,20 +32,25 @@ impl GameSession {
     /// Create a new game session with the given seed and card set ID.
     #[new]
     fn new(seed: u64, set_id: u32) -> PyResult<Self> {
-        let card_pool = oab_core::cards::build_card_pool();
-        let all_sets = oab_core::cards::get_all_sets();
+        let card_pool = oab_assets::cards::build_pool();
+        let all_sets = oab_assets::sets::get_all();
         let card_set = all_sets
             .into_iter()
             .nth(set_id as usize)
             .ok_or_else(|| PyRuntimeError::new_err(format!("Card set {} not found", set_id)))?;
 
-        let mut state = GameState::new(seed);
-        state.card_pool = card_pool;
-        state.set_id = set_id;
-        state.local_state.bag = create_starting_bag(&card_set, seed);
-        state.local_state.next_card_id = 1000;
-        state.draw_hand();
-        apply_shop_start_triggers(&mut state);
+        let config = default_config();
+        let bag_size = config.bag_size as usize;
+
+        let mut state = oab_game::GameState::new(seed, config);
+        state.shop.card_pool = card_pool;
+        state.shop.set_id = set_id;
+        state.bag = create_starting_bag(&card_set, seed, bag_size);
+        state.next_card_id = 1000;
+        state.lives = state.config.starting_lives;
+        let hand_size = state.config.hand_size as usize;
+        state.draw_hand(hand_size);
+        apply_shop_start_triggers(&mut state.shop);
 
         Ok(Self { state, card_set })
     }
@@ -55,15 +60,20 @@ impl GameSession {
         if let Some(set_id) = set_id {
             *self = GameSession::new(seed, set_id)?;
         } else {
-            let card_pool = std::mem::take(&mut self.state.card_pool);
-            let sid = self.state.set_id;
-            self.state = GameState::new(seed);
-            self.state.card_pool = card_pool;
-            self.state.set_id = sid;
-            self.state.local_state.bag = create_starting_bag(&self.card_set, seed);
-            self.state.local_state.next_card_id = 1000;
-            self.state.draw_hand();
-            apply_shop_start_triggers(&mut self.state);
+            let card_pool = std::mem::take(&mut self.state.shop.card_pool);
+            let sid = self.state.shop.set_id;
+            let config = self.state.config.clone();
+            let bag_size = config.bag_size as usize;
+            let hand_size = config.hand_size as usize;
+
+            self.state = oab_game::GameState::new(seed, config);
+            self.state.shop.card_pool = card_pool;
+            self.state.shop.set_id = sid;
+            self.state.bag = create_starting_bag(&self.card_set, seed, bag_size);
+            self.state.next_card_id = 1000;
+            self.state.lives = self.state.config.starting_lives;
+            self.state.draw_hand(hand_size);
+            apply_shop_start_triggers(&mut self.state.shop);
         }
         Ok(self.state_json())
     }
@@ -75,11 +85,12 @@ impl GameSession {
 
     /// Get all cards in the card pool as JSON.
     fn get_cards(&self) -> String {
-        let cards: Vec<oab_core::view::CardView> = self
+        let cards: Vec<CardView> = self
             .state
+            .shop
             .card_pool
             .values()
-            .map(oab_core::view::CardView::from)
+            .map(CardView::from)
             .collect();
         serde_json::to_string(&cards).unwrap_or_else(|_| "[]".into())
     }
@@ -100,10 +111,10 @@ impl GameSession {
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid actions JSON: {}", e)))?;
 
         let action = CommitTurnAction { actions };
-        oab_core::commit::verify_and_apply_turn(&mut self.state, &action)
+        oab_battle::commit::verify_and_apply_turn(&mut self.state.shop, &action)
             .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
 
-        self.state.shop_mana = 0;
+        self.state.shop.shop_mana = 0;
         self.state.phase = GamePhase::Battle;
 
         Ok(self.state_json())
@@ -124,23 +135,31 @@ impl GameSession {
         let opponent: Vec<OpponentUnit> = serde_json::from_str(opponent_json)
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid opponent JSON: {}", e)))?;
 
-        let completed_round = self.state.round;
+        let completed_round = self.state.shop.round;
         let outcome = self.run_battle(&opponent);
 
-        let game_over = self.state.wins >= WINS_TO_VICTORY || self.state.lives <= 0;
+        let game_over = self.state.wins >= self.state.config.wins_to_victory
+            || self.state.lives <= 0;
         let game_result = if game_over {
             self.state.phase = GamePhase::Completed;
-            Some(if self.state.wins >= WINS_TO_VICTORY {
+            Some(if self.state.wins >= self.state.config.wins_to_victory {
                 "victory"
             } else {
                 "defeat"
             })
         } else {
-            self.state.round += 1;
-            self.state.mana_limit = self.state.calculate_mana_limit();
+            self.state.shop.round += 1;
+            self.state.shop.mana_limit = self
+                .state
+                .config
+                .mana_limit_for_round(self.state.shop.round);
             self.state.phase = GamePhase::Shop;
-            self.state.draw_hand();
-            apply_shop_start_triggers_with_result(&mut self.state, Some(outcome.result.clone()));
+            let hand_size = self.state.config.hand_size as usize;
+            self.state.draw_hand(hand_size);
+            apply_shop_start_triggers_with_result(
+                &mut self.state.shop,
+                Some(outcome.result.clone()),
+            );
             None
         };
 
@@ -188,8 +207,13 @@ struct BattleOutcome {
 
 impl GameSession {
     fn state_json(&self) -> String {
-        let hand_used = vec![false; self.state.hand.len()];
-        let view = GameView::from_state(&self.state, self.state.shop_mana, &hand_used, false);
+        let hand_used = vec![false; self.state.shop.hand.len()];
+        let view = GameView::from_state(
+            &self.state,
+            self.state.shop.shop_mana,
+            &hand_used,
+            false,
+        );
 
         // Build bag summary
         let mut bag_counts: BTreeMap<CardId, u32> = BTreeMap::new();
@@ -199,7 +223,7 @@ impl GameSession {
         let bag: Vec<serde_json::Value> = bag_counts
             .into_iter()
             .filter_map(|(card_id, count)| {
-                let card = self.state.card_pool.get(&card_id)?;
+                let card = self.state.shop.card_pool.get(&card_id)?;
                 Some(json!({
                     "card_id": card_id.0,
                     "name": card.name,
@@ -230,16 +254,18 @@ impl GameSession {
     }
 
     fn run_battle(&mut self, opponent: &[OpponentUnit]) -> BattleOutcome {
+        let board_size = self.state.config.board_size as usize;
         let mut player_slots = Vec::new();
         let player_units: Vec<CombatUnit> = self
             .state
+            .shop
             .board
             .iter()
             .enumerate()
             .filter_map(|(slot, unit)| {
                 let u = unit.as_ref()?;
                 player_slots.push(slot);
-                let card = self.state.card_pool.get(&u.card_id)?;
+                let card = self.state.shop.card_pool.get(&u.card_id)?;
                 let mut cu = CombatUnit::from_card(card.clone());
                 cu.attack_buff = u.perm_attack;
                 cu.health_buff = u.perm_health;
@@ -250,13 +276,23 @@ impl GameSession {
 
         let enemy_units = self.build_opponent(opponent);
 
-        let battle_seed = self.state.round as u64;
+        let battle_seed = self.state.shop.round as u64;
         let mut rng = XorShiftRng::seed_from_u64(battle_seed);
-        let events = resolve_battle(player_units, enemy_units, &mut rng, &self.state.card_pool);
+        let events = resolve_battle(
+            player_units,
+            enemy_units,
+            &mut rng,
+            &self.state.shop.card_pool,
+            board_size,
+        );
 
-        self.state.shop_mana = player_shop_mana_delta_from_events(&events).max(0);
+        self.state.shop.shop_mana = player_shop_mana_delta_from_events(&events).max(0);
         let permanent_deltas = player_permanent_stat_deltas_from_events(&events);
-        apply_permanent_deltas(&mut self.state, &player_slots, &permanent_deltas);
+        apply_permanent_deltas(
+            &mut self.state.shop,
+            &player_slots,
+            &permanent_deltas,
+        );
 
         let result = events
             .iter()
@@ -280,13 +316,14 @@ impl GameSession {
     }
 
     fn build_opponent(&self, units: &[OpponentUnit]) -> Vec<CombatUnit> {
-        let mut board: Vec<Option<CombatUnit>> = vec![None; BOARD_SIZE];
+        let board_size = self.state.config.board_size as usize;
+        let mut board: Vec<Option<CombatUnit>> = vec![None; board_size];
         for u in units {
             let slot = u.slot as usize;
             if slot >= board.len() {
                 continue;
             }
-            if let Some(card) = self.state.card_pool.get(&CardId(u.card_id)) {
+            if let Some(card) = self.state.shop.card_pool.get(&CardId(u.card_id)) {
                 let mut cu = CombatUnit::from_card(card.clone());
                 cu.attack_buff = u.perm_attack;
                 cu.health_buff = u.perm_health;
@@ -300,7 +337,7 @@ impl GameSession {
 
 /// Apply permanent stat deltas from battle events to the player's board.
 fn apply_permanent_deltas(
-    state: &mut GameState,
+    state: &mut oab_battle::state::ShopState,
     player_slots: &[usize],
     deltas: &BTreeMap<UnitId, (i32, i32)>,
 ) {
@@ -312,14 +349,17 @@ fn apply_permanent_deltas(
 
         let slot = player_slots[unit_index - 1];
 
-        let death_check =
-            if let Some(board_unit) = state.board.get_mut(slot).and_then(|s| s.as_mut()) {
-                board_unit.perm_attack = board_unit.perm_attack.saturating_add(*attack_delta);
-                board_unit.perm_health = board_unit.perm_health.saturating_add(*health_delta);
-                Some((board_unit.card_id, board_unit.perm_health))
-            } else {
-                None
-            };
+        let death_check = if let Some(board_unit) = state
+            .board
+            .get_mut(slot)
+            .and_then(|s| s.as_mut())
+        {
+            board_unit.perm_attack = board_unit.perm_attack.saturating_add(*attack_delta);
+            board_unit.perm_health = board_unit.perm_health.saturating_add(*health_delta);
+            Some((board_unit.card_id, board_unit.perm_health))
+        } else {
+            None
+        };
 
         let should_remove = death_check
             .and_then(|(card_id, perm_health)| {

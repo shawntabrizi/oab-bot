@@ -8,7 +8,9 @@ name = "oab_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-oab-core = { path = "../../open-auto-battler/core", features = ["std"] }
+oab-battle = { path = "../deps/open-auto-battler/battle", features = ["std"] }
+oab-assets = { path = "../deps/open-auto-battler/assets", features = ["std"] }
+oab-game = { path = "../deps/open-auto-battler/game", features = ["std"] }
 pyo3 = { version = "0.25", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

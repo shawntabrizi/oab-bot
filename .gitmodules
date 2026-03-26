@@ -1,0 +1,3 @@
+[submodule "deps/open-auto-battler"]
+	path = deps/open-auto-battler
+	url = https://github.com/shawntabrizi/open-auto-battler.git
