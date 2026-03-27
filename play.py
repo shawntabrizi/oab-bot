@@ -19,7 +19,8 @@ import requests
 from sb3_contrib import MaskablePPO
 
 import oab_py
-from oab_shared import HAND_SIZE, BOARD_SIZE, ACTION_TABLE
+from config import load_saved_model_config
+from oab_shared import BOARD_SIZE, HAND_SIZE, PhaseController
 
 
 # ── Server Client ──
@@ -75,10 +76,11 @@ def _board_str(board):
 
 # ── Bot ──
 
-def play_game(model, client, session, set_id, game_num, verbose=True):
+def play_game(model, client, session, phase_controller, set_id, game_num, verbose=True):
     """Play a single game. Server is the authority; local session provides obs/mask."""
     state = client.reset(set_id=set_id)
     session.sync_from_state_json(json.dumps(state))
+    phase_controller.reset()
 
     pending_actions = []
     action_log = []
@@ -90,11 +92,21 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
         print(f"{'=' * 60}")
 
     while True:
-        obs = np.array(session.get_observation(), dtype=np.float32)
-        masks = np.array(session.get_action_mask(), dtype=bool)
+        obs = phase_controller.augment_observation(
+            np.array(session.get_observation(), dtype=np.float32)
+        )
+        masks = phase_controller.apply_mask(
+            np.array(session.get_action_mask(), dtype=bool)
+        )
         action, _ = model.predict(obs, action_masks=masks, deterministic=True)
         action = int(action)
-        action_type, params = ACTION_TABLE[action]
+        action_type, params = phase_controller.describe_action(action)
+
+        if action_type == "DoneShopping":
+            if verbose:
+                action_log.append("Done shopping; switch to positioning")
+            phase_controller.advance_to_position()
+            continue
 
         if action_type == "EndTurn":
             if verbose:
@@ -166,6 +178,7 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
             # Sync local session from server's new state
             session.sync_from_state_json(json.dumps(next_state))
             turn_start_state = next_state
+            phase_controller.finish_turn()
         else:
             # Log for display
             if verbose:
@@ -178,6 +191,7 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
 
             # Apply to local session for obs/mask
             session.apply_action(action)
+            phase_controller.record_action(action)
 
 
 def main():
@@ -190,7 +204,7 @@ def main():
                         help="Path to trained model (default: models/oab_agent)")
     parser.add_argument("--games", type=int, default=1,
                         help="Number of games to play (default: 1)")
-    parser.add_argument("--set", type=int, default=0,
+    parser.add_argument("--set", type=int, default=None,
                         help="Card set ID (default: 0)")
     parser.add_argument("--quiet", action="store_true",
                         help="Only print game results, not per-round details")
@@ -200,17 +214,29 @@ def main():
 
     print(f"Loading model from {args.model}...")
     model = MaskablePPO.load(args.model)
+    config = load_saved_model_config(args.model)
+    set_id = config.set_id if args.set is None else args.set
 
-    print(f"Connecting to {args.url} (set {args.set})...")
+    print(f"Connecting to {args.url} (set {set_id})...")
+    if config.phase_decomposition:
+        print(
+            "Using phase decomposition: "
+            f"{config.shop_action_limit} shop / {config.position_action_limit} position"
+        )
     client = OABClient(args.url)
-    session = oab_py.GameSession(0, args.set)
+    session = oab_py.GameSession(0, set_id)
+    phase_controller = PhaseController(
+        enabled=config.phase_decomposition,
+        shop_action_limit=config.shop_action_limit,
+        position_action_limit=config.position_action_limit,
+    )
 
     victories = 0
     defeats = 0
     errors = 0
 
     for game_num in range(1, args.games + 1):
-        result = play_game(model, client, session, args.set, game_num,
+        result = play_game(model, client, session, phase_controller, set_id, game_num,
                            verbose=not args.quiet)
 
         if result["result"] == "victory":

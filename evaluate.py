@@ -20,8 +20,9 @@ from collections import defaultdict
 import numpy as np
 from sb3_contrib import MaskablePPO
 
+from config import load_saved_model_config
 from env import OABEnv
-from oab_shared import ACTION_TABLE, MatchedPool
+from oab_shared import MatchedPool
 
 
 def wilson_ci(successes, total, z=1.96):
@@ -38,9 +39,12 @@ def wilson_ci(successes, total, z=1.96):
     return (max(0.0, center - spread) * 100, min(1.0, center + spread) * 100)
 
 
-def run_evaluation(model, set_id, num_games, shared_pool=False):
+def run_evaluation(model, config, num_games, shared_pool=False):
     """Run games and collect statistics."""
-    pool = MatchedPool()
+    pool = MatchedPool(
+        max_per_bucket=config.max_boards_per_bucket,
+        challenge_probability=config.challenge_probability,
+    )
 
     results = []
     card_stats = defaultdict(lambda: {
@@ -53,8 +57,24 @@ def run_evaluation(model, set_id, num_games, shared_pool=False):
 
     for game in range(1, num_games + 1):
         if not shared_pool:
-            pool = MatchedPool()
-        env = OABEnv(set_id=set_id, board_pool=pool)
+            pool = MatchedPool(
+                max_per_bucket=config.max_boards_per_bucket,
+                challenge_probability=config.challenge_probability,
+            )
+        env = OABEnv(
+            set_id=config.set_id,
+            board_pool=pool,
+            action_cost=config.action_cost,
+            repeat_penalty=config.repeat_penalty,
+            play_reward=config.play_reward,
+            reorder_penalty=config.reorder_penalty,
+            board_unit_reward=config.board_unit_reward,
+            empty_board_penalty=config.empty_board_penalty,
+            phase_decomposition=config.phase_decomposition,
+            shop_action_limit=config.shop_action_limit,
+            position_action_limit=config.position_action_limit,
+            max_rounds=config.max_rounds,
+        )
 
         obs, info = env.reset()
         total_reward = 0
@@ -72,7 +92,7 @@ def run_evaluation(model, set_id, num_games, shared_pool=False):
             action = int(action)
 
             # Track card-level actions before stepping
-            action_type, params = ACTION_TABLE[action]
+            action_type, params = env.describe_action(action)
             hand_names = env.get_hand_names()
             if action_type == "BurnFromHand":
                 name = hand_names[params["hand_index"]]
@@ -212,7 +232,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate OAB RL agent")
     parser.add_argument("--model-path", default="models/oab_agent",
                         help="Path to trained model (without .zip)")
-    parser.add_argument("--set-id", type=int, default=0,
+    parser.add_argument("--set-id", type=int, default=None,
                         help="Card set ID")
     parser.add_argument("--num-games", type=int, default=100,
                         help="Number of games to evaluate")
@@ -223,11 +243,31 @@ def main():
     args = parser.parse_args()
 
     model = MaskablePPO.load(args.model_path)
+    config = load_saved_model_config(args.model_path)
+    if args.set_id is not None:
+        config.set_id = args.set_id
 
-    print(f"Evaluating {args.model_path} for {args.num_games} games on set {args.set_id}...")
-    results, card_stats = run_evaluation(model, args.set_id, args.num_games,
+    print(f"Evaluating {args.model_path} for {args.num_games} games on set {config.set_id}...")
+    if config.phase_decomposition:
+        print(
+            "Using phase decomposition: "
+            f"{config.shop_action_limit} shop / {config.position_action_limit} position"
+        )
+    print(
+        "Reward shaping: "
+        f"action {config.action_cost}, repeat {config.repeat_penalty}, "
+        f"play +{config.play_reward}, reorder {config.reorder_penalty}, "
+        f"board +{config.board_unit_reward}/unit, empty {config.empty_board_penalty}; "
+        f"round cap {config.max_rounds}"
+    )
+    print(
+        "Opponent pool: "
+        f"max {config.max_boards_per_bucket}/bucket, "
+        f"challenge {config.challenge_probability:.2f}"
+    )
+    results, card_stats = run_evaluation(model, config, args.num_games,
                                           shared_pool=args.shared_pool)
-    print_summary(results, card_stats, args.set_id)
+    print_summary(results, card_stats, config.set_id)
 
     if args.output:
         export_results(results, card_stats, args.output)

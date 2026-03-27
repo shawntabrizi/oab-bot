@@ -28,6 +28,7 @@ use pyo3::prelude::*;
 use serde_json::json;
 
 const DEFAULT_MAX_ACTIONS_PER_TURN: usize = 15;
+const DEFAULT_MAX_ROUNDS_PER_GAME: i32 = 20;
 
 /// A local game session exposed to Python.
 #[pyclass]
@@ -40,6 +41,7 @@ struct GameSession {
     /// Number of actions applied this turn.
     action_count: usize,
     max_actions_per_turn: usize,
+    max_rounds_per_game: i32,
 }
 
 impl GameSession {
@@ -109,6 +111,7 @@ impl GameSession {
             turn_ctx,
             action_count: 0,
             max_actions_per_turn: DEFAULT_MAX_ACTIONS_PER_TURN,
+            max_rounds_per_game: DEFAULT_MAX_ROUNDS_PER_GAME,
         })
     }
 
@@ -194,15 +197,27 @@ impl GameSession {
         let opponent: Vec<OpponentUnit> = serde_json::from_str(opponent_json)
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid opponent JSON: {}", e)))?;
 
+        let completed_round = self.state.shop.round;
         let outcome = self.run_battle(&opponent);
 
-        let game_over =
-            self.state.wins >= self.state.config.wins_to_victory || self.state.lives <= 0;
+        let won_game = self.state.wins >= self.state.config.wins_to_victory;
+        let lost_game = self.state.lives <= 0;
+        let capped_out =
+            !won_game && !lost_game && self.max_rounds_per_game > 0 && completed_round >= self.max_rounds_per_game;
+        let game_over = won_game || lost_game || capped_out;
 
-        let reward = match &outcome.result {
-            BattleResult::Victory => 1.0,
-            BattleResult::Defeat => -1.0,
-            BattleResult::Draw => 0.0,
+        // Reward scales with win count: winning when you already have 8 wins
+        // is worth more than your first win. This incentivizes closing out games
+        // fast rather than grinding slowly.
+        let wins = self.state.wins as f32; // wins AFTER this battle's result
+        let reward = if capped_out {
+            -1.0
+        } else {
+            match &outcome.result {
+                BattleResult::Victory => wins,     // 1st win = +1, 10th win = +10
+                BattleResult::Defeat => -1.0,
+                BattleResult::Draw => -0.1,
+            }
         };
 
         let battle_result_str = match &outcome.result {
@@ -212,8 +227,11 @@ impl GameSession {
         };
 
         let game_result = if game_over {
+            if capped_out {
+                self.state.lives = 0;
+            }
             self.state.phase = GamePhase::Completed;
-            Some(if self.state.wins >= self.state.config.wins_to_victory {
+            Some(if won_game {
                 "victory"
             } else {
                 "defeat"
@@ -246,6 +264,7 @@ impl GameSession {
             "wins": self.state.wins,
             "battle_result": battle_result_str,
             "game_result": game_result,
+            "termination_reason": if capped_out { Some("max_rounds") } else { None::<&str> },
         });
 
         Ok((reward, game_over, info.to_string()))
@@ -257,6 +276,10 @@ impl GameSession {
         for (slot, unit) in self.state.shop.board.iter().enumerate() {
             if let Some(bu) = unit {
                 let mut entry = json!({"card_id": bu.card_id.0, "slot": slot});
+                if let Some(card) = self.state.shop.card_pool.get(&bu.card_id) {
+                    entry["attack"] = json!(card.stats.attack.saturating_add(bu.perm_attack));
+                    entry["health"] = json!(card.stats.health.saturating_add(bu.perm_health));
+                }
                 if bu.perm_attack != 0 {
                     entry["perm_attack"] = json!(bu.perm_attack);
                 }
@@ -310,6 +333,10 @@ impl GameSession {
 
     fn pending_action_count(&self) -> usize {
         self.action_count
+    }
+
+    fn set_max_rounds(&mut self, max_rounds: i32) {
+        self.max_rounds_per_game = max_rounds;
     }
 
     /// Observation vector dimension (depends on the card set).
@@ -405,8 +432,10 @@ impl GameSession {
     // ── Legacy JSON API (for play.py and debugging) ──
 
     fn reset(&mut self, seed: u64, set_id: Option<u32>) -> PyResult<String> {
+        let max_rounds_per_game = self.max_rounds_per_game;
         if let Some(set_id) = set_id {
             *self = GameSession::new(seed, set_id)?;
+            self.max_rounds_per_game = max_rounds_per_game;
         } else {
             let card_pool = std::mem::take(&mut self.state.shop.card_pool);
             let sid = self.state.shop.set_id;
@@ -484,11 +513,17 @@ impl GameSession {
         let completed_round = self.state.shop.round;
         let outcome = self.run_battle(&opponent);
 
-        let game_over =
-            self.state.wins >= self.state.config.wins_to_victory || self.state.lives <= 0;
+        let won_game = self.state.wins >= self.state.config.wins_to_victory;
+        let lost_game = self.state.lives <= 0;
+        let capped_out =
+            !won_game && !lost_game && self.max_rounds_per_game > 0 && completed_round >= self.max_rounds_per_game;
+        let game_over = won_game || lost_game || capped_out;
         let game_result = if game_over {
+            if capped_out {
+                self.state.lives = 0;
+            }
             self.state.phase = GamePhase::Completed;
-            Some(if self.state.wins >= self.state.config.wins_to_victory {
+            Some(if won_game {
                 "victory"
             } else {
                 "defeat"
@@ -514,10 +549,14 @@ impl GameSession {
 
         self.reset_turn();
 
-        let reward = match &outcome.result {
-            BattleResult::Victory => 1,
-            BattleResult::Defeat => -1,
-            BattleResult::Draw => 0,
+        let reward = if capped_out {
+            -1
+        } else {
+            match &outcome.result {
+                BattleResult::Victory => 1,
+                BattleResult::Defeat => -1,
+                BattleResult::Draw => 0,
+            }
         };
         let battle_result_str = match &outcome.result {
             BattleResult::Victory => "Victory",
@@ -530,6 +569,7 @@ impl GameSession {
             "battle_result": battle_result_str,
             "game_over": game_over,
             "game_result": game_result,
+            "termination_reason": if capped_out { Some("max_rounds") } else { None::<&str> },
             "reward": reward,
             "state": serde_json::from_str::<serde_json::Value>(&self.state_json()).unwrap(),
         });

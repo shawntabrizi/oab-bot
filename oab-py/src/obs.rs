@@ -80,7 +80,9 @@ pub struct ObsConstants {
 const HAND_BASE: usize = 7; // presence, id, atk, hp, cost, burn, can_afford
 const BOARD_BASE: usize = 8; // presence, id, atk, hp, cost, burn, perm_atk, perm_hp
 const SCALAR_FEATURES: usize = 6;
-const BAG_CARD_BASE: usize = 6; // count_fraction, id, atk, hp, cost, burn
+// Bag encoding disabled for now to reduce observation size during training experiments.
+// TODO: re-enable when model architecture can handle the larger input.
+const BAG_CARD_BASE: usize = 0;
 
 // Per battle ability (not counting conditions):
 //   has_ability(1) + trigger(13) + effect_type(6) +
@@ -195,8 +197,8 @@ impl ObsConstants {
             }
         }
 
-        // max_bag_card_types = number of unique cards in this set
-        let max_bag_card_types = set_card_ids.len();
+        // Bag encoding disabled — set to 0 to exclude from observation
+        let max_bag_card_types = 0;
 
         // Add headroom for perm buffs on attack/health
         let perm_headroom = max_effect_value.max(4);

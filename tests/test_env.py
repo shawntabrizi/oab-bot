@@ -60,7 +60,7 @@ def test_step_endturn_triggers_battle(env):
     obs, reward, terminated, truncated, info = env.step(0)
     session = oab_py.GameSession(0, env.set_id)
     assert obs.shape == (session.obs_dim(),)
-    assert reward in (-1.0, 0.0, 1.0)
+    assert isinstance(reward, float)
     assert "battle_result" in info
 
 
@@ -97,3 +97,69 @@ def test_get_hand_names(env):
     names = env.get_hand_names()
     assert isinstance(names, list)
     assert any(n is not None for n in names)
+
+
+def test_phase_decomposition_adds_phase_features():
+    from env import OABEnv
+    from oab_shared import MatchedPool
+
+    env = OABEnv(set_id=0, board_pool=MatchedPool(), phase_decomposition=True)
+    obs, info = env.reset()
+    session = oab_py.GameSession(0, env.set_id)
+
+    assert obs.shape == (session.obs_dim() + 2,)
+    assert info["phase"] == "shop"
+    assert np.array_equal(obs[-2:], np.array([1.0, 0.0], dtype=np.float32))
+
+
+def test_phase_decomposition_done_shopping_transitions_phase():
+    from env import OABEnv
+    from oab_shared import MatchedPool
+
+    env = OABEnv(set_id=0, board_pool=MatchedPool(), phase_decomposition=True)
+    env.reset(seed=0)
+
+    obs, reward, terminated, truncated, info = env.step(0)
+
+    assert reward == 0.0
+    assert not terminated
+    assert not truncated
+    assert info["phase"] == "position"
+    assert env.describe_action(0) == ("EndTurn", {})
+    assert np.array_equal(obs[-2:], np.array([0.0, 1.0], dtype=np.float32))
+
+
+def test_round_cap_forces_defeat():
+    from env import OABEnv
+    from oab_shared import MatchedPool
+
+    env = OABEnv(set_id=0, board_pool=MatchedPool(), max_rounds=1)
+    env.reset(seed=0)
+
+    _, reward, terminated, truncated, info = env.step(0)
+
+    assert terminated
+    assert not truncated
+    assert reward == -1.0
+    assert info["game_result"] == "defeat"
+    assert info["termination_reason"] == "max_rounds"
+
+
+def test_end_turn_reports_board_reward_components():
+    from env import OABEnv
+    from oab_shared import MatchedPool
+
+    env = OABEnv(
+        set_id=0,
+        board_pool=MatchedPool(),
+        board_unit_reward=0.0,
+        empty_board_penalty=-0.25,
+    )
+    env.reset(seed=0)
+
+    _, reward, terminated, truncated, info = env.step(0)
+
+    assert not truncated
+    assert isinstance(reward, float)
+    assert info["board_units"] == 0
+    assert info["end_turn_reward"] == -0.25
