@@ -1,13 +1,13 @@
 #!/usr/bin/env python3 -u
-"""Play Open Auto Battler on a live server using a trained RL model.
+"""Play Open Auto Battler on a blockchain using a trained RL model.
 
-Uses a local oab_py.GameSession for observation encoding and action masking
-(engine-authoritative), while communicating with the server for actual gameplay.
+Connects to the OAB HTTP server (which proxies to a blockchain node)
+and plays games using the trained MaskablePPO agent.
 
 Usage:
-    python play.py --url http://localhost:3000
-    python play.py --url http://localhost:3000 --local --set 1
-    python play.py --url http://localhost:3000 --model models/oab_agent_5m --games 10
+    python play.py --url http://localhost:3030
+    python play.py --url http://localhost:3030 --set 1 --games 5
+    python play.py --url http://localhost:3030 --model models/oab_agent_5m
 """
 
 import argparse
@@ -25,17 +25,13 @@ from oab_shared import HAND_SIZE, BOARD_SIZE, ACTION_TABLE
 # ── Server Client ──
 
 class OABClient:
-    """HTTP client for the OAB game server."""
+    """HTTP client for the OAB game server (chain mode)."""
 
-    def __init__(self, base_url, local_mode=False, agent_id="bot"):
+    def __init__(self, base_url):
         self.base_url = base_url.rstrip("/")
-        self.local_mode = local_mode
-        self.agent_id = agent_id
 
     def reset(self, seed=None, set_id=0):
         body = {"set_id": set_id}
-        if self.local_mode:
-            body["agent_id"] = self.agent_id
         if seed is not None:
             body["seed"] = seed
         resp = requests.post(f"{self.base_url}/reset", json=body)
@@ -44,26 +40,6 @@ class OABClient:
 
     def submit(self, actions):
         resp = requests.post(f"{self.base_url}/submit", json={"actions": actions})
-        resp.raise_for_status()
-        return resp.json()
-
-    def shop(self, actions):
-        body = {"agent_id": self.agent_id, "actions": actions}
-        resp = requests.post(f"{self.base_url}/shop", json=body)
-        resp.raise_for_status()
-        return resp.json()
-
-    def battle(self, opponent=None):
-        body = {"agent_id": self.agent_id, "opponent": opponent or []}
-        resp = requests.post(f"{self.base_url}/battle", json=body)
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_state(self):
-        params = {}
-        if self.local_mode:
-            params["agent_id"] = self.agent_id
-        resp = requests.get(f"{self.base_url}/state", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -100,14 +76,11 @@ def _board_str(board):
 # ── Bot ──
 
 def play_game(model, client, session, set_id, game_num, verbose=True):
-    """Play a single game using the server for gameplay, local session for obs/mask."""
+    """Play a single game. Server is the authority; local session provides obs/mask."""
     state = client.reset(set_id=set_id)
-    # Sync local session to same seed/state
-    session.reset(state.get("round", 1), None)  # reset with arbitrary seed
-    # Re-create session to match server state
-    # (In practice, the model just needs consistent obs encoding)
+    session.sync_from_state_json(json.dumps(state))
 
-    pending_server_actions = []
+    pending_actions = []
     action_log = []
     turn_start_state = state
 
@@ -157,21 +130,13 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
                     print(f"    -> End turn (no shop actions)")
 
             # Submit to server
-            if client.local_mode:
-                try:
-                    client.shop(pending_server_actions)
-                    result = client.battle()
-                except requests.HTTPError as e:
-                    print(f"  Error: {e.response.text}")
-                    return {"result": "error", "wins": 0, "reward": 0}
-            else:
-                try:
-                    result = client.submit(pending_server_actions)
-                except requests.HTTPError as e:
-                    print(f"  Error: {e.response.text}")
-                    return {"result": "error", "wins": 0, "reward": 0}
+            try:
+                result = client.submit(pending_actions)
+            except requests.HTTPError as e:
+                print(f"  Error: {e.response.text}")
+                return {"result": "error", "wins": 0, "reward": 0}
 
-            pending_server_actions = []
+            pending_actions = []
             action_log = []
 
             battle_result = result["battle_result"]
@@ -198,8 +163,8 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
                     print(f"  {'=' * 40}")
                 return {"result": game_result, "wins": wins, "reward": result["reward"]}
 
-            # Advance local session: commit turn with empty opponent (just for state sync)
-            session.commit_turn_and_battle("[]")
+            # Sync local session from server's new state
+            session.sync_from_state_json(json.dumps(next_state))
             turn_start_state = next_state
         else:
             # Log for display
@@ -209,7 +174,7 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
             # Build server action
             server_action = {"type": action_type}
             server_action.update(params)
-            pending_server_actions.append(server_action)
+            pending_actions.append(server_action)
 
             # Apply to local session for obs/mask
             session.apply_action(action)
@@ -217,20 +182,16 @@ def play_game(model, client, session, set_id, game_num, verbose=True):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Play OAB on a server using a trained RL model"
+        description="Play OAB on-chain using a trained RL model"
     )
-    parser.add_argument("--url", default="http://localhost:3000",
-                        help="OAB server URL (default: http://localhost:3000)")
+    parser.add_argument("--url", default="http://localhost:3030",
+                        help="OAB server URL (default: http://localhost:3030)")
     parser.add_argument("--model", default="models/oab_agent",
                         help="Path to trained model (default: models/oab_agent)")
     parser.add_argument("--games", type=int, default=1,
                         help="Number of games to play (default: 1)")
     parser.add_argument("--set", type=int, default=0,
                         help="Card set ID (default: 0)")
-    parser.add_argument("--local", action="store_true",
-                        help="Use local mode (POST /shop + /battle)")
-    parser.add_argument("--agent-id", default="bot",
-                        help="Agent ID for local mode sessions (default: bot)")
     parser.add_argument("--quiet", action="store_true",
                         help="Only print game results, not per-round details")
     parser.add_argument("--delay", type=float, default=0,
@@ -240,11 +201,8 @@ def main():
     print(f"Loading model from {args.model}...")
     model = MaskablePPO.load(args.model)
 
-    mode = "local" if args.local else "chain"
-    print(f"Connecting to {args.url} ({mode} mode, set {args.set})...")
-    client = OABClient(args.url, local_mode=args.local, agent_id=args.agent_id)
-
-    # Local session for obs/mask encoding (engine-authoritative)
+    print(f"Connecting to {args.url} (set {args.set})...")
+    client = OABClient(args.url)
     session = oab_py.GameSession(0, args.set)
 
     victories = 0
@@ -266,7 +224,7 @@ def main():
             time.sleep(args.delay)
 
     print(f"\n{'=' * 40}")
-    print(f"  Results ({args.games} games, {mode} mode)")
+    print(f"  Results ({args.games} games)")
     print(f"{'=' * 40}")
     print(f"  Victories: {victories} ({100*victories/args.games:.1f}%)")
     print(f"  Defeats:   {defeats} ({100*defeats/args.games:.1f}%)")

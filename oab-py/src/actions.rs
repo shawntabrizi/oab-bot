@@ -116,14 +116,16 @@ pub fn compute_action_mask(
     }
 
     // PlayFromHand(hi, bs): actions 6-30
+    // Engine allows playing to occupied slots (insert-shift) as long as board isn't full.
+    let board_full = shadow_board.iter().all(|s| s.is_some());
     for hi in 0..HAND_SIZE {
         if let Some(Some(card_id)) = shadow_hand.get(hi) {
             if let Some(card) = card_pool.get(card_id) {
                 if shadow_mana >= card.economy.play_cost {
                     for bs in 0..BOARD_SIZE {
-                        let board_empty =
-                            shadow_board.get(bs).map_or(false, |s| s.is_none());
-                        mask[6 + hi * BOARD_SIZE + bs] = board_empty;
+                        // Valid if slot is empty OR board isn't full (engine will shift)
+                        let slot_empty = shadow_board.get(bs).map_or(false, |s| s.is_none());
+                        mask[6 + hi * BOARD_SIZE + bs] = slot_empty || !board_full;
                     }
                 }
             }
@@ -136,13 +138,16 @@ pub fn compute_action_mask(
     }
 
     // SwapBoard: actions 36-45 (10 unordered pairs)
+    // Engine allows swapping any two slots (including empty ones).
+    // Only useful if at least one has a unit (swapping two empties is a no-op).
     for (pi, &(a, b)) in SWAP_PAIRS.iter().enumerate() {
         let a_some = shadow_board.get(a).map_or(false, |s| s.is_some());
         let b_some = shadow_board.get(b).map_or(false, |s| s.is_some());
-        mask[36 + pi] = a_some && b_some;
+        mask[36 + pi] = a_some || b_some;
     }
 
     // MoveBoard: actions 46-65 (20 ordered pairs)
+    // Engine requires BOTH from and to to be occupied.
     for (pi, &(f, t)) in MOVE_PAIRS.iter().enumerate() {
         let f_some = shadow_board.get(f).map_or(false, |s| s.is_some());
         let t_some = shadow_board.get(t).map_or(false, |s| s.is_some());

@@ -323,6 +323,82 @@ impl GameSession {
         actions::NUM_ACTIONS
     }
 
+    /// Sync internal state from a server JSON response.
+    /// Used by play.py to keep the local session in sync with the server
+    /// so that get_observation/get_action_mask produce correct results.
+    fn sync_from_state_json(&mut self, state_json: &str) -> PyResult<()> {
+        let state: serde_json::Value = serde_json::from_str(state_json)
+            .map_err(|e| PyRuntimeError::new_err(format!("Invalid state JSON: {}", e)))?;
+
+        // Rebuild hand from JSON hand array (CardIds looked up by name/id)
+        self.state.shop.hand.clear();
+        if let Some(hand) = state["hand"].as_array() {
+            for entry in hand {
+                if entry.is_null() {
+                    continue;
+                }
+                // Find the CardId by matching the card name or id
+                if let Some(card_id) = self.find_card_id_from_json(entry) {
+                    self.state.shop.hand.push(card_id);
+                }
+            }
+        }
+
+        // Rebuild board from JSON board array
+        let board_size = self.state.config.board_size as usize;
+        self.state.shop.board = vec![None; board_size];
+        if let Some(board) = state["board"].as_array() {
+            for (i, entry) in board.iter().enumerate() {
+                if i >= board_size || entry.is_null() {
+                    continue;
+                }
+                if let Some(card_id) = self.find_card_id_from_json(entry) {
+                    let perm_attack = entry["perm_attack"].as_i64().unwrap_or(0) as i32;
+                    let perm_health = entry["perm_health"].as_i64().unwrap_or(0) as i32;
+                    self.state.shop.board[i] = Some(BoardUnit {
+                        card_id,
+                        perm_attack,
+                        perm_health,
+                    });
+                }
+            }
+        }
+
+        // Sync scalars
+        if let Some(mana) = state["mana"].as_i64() {
+            self.state.shop.shop_mana = mana as i32;
+        }
+        if let Some(mana_limit) = state["mana_limit"].as_i64() {
+            self.state.shop.mana_limit = mana_limit as i32;
+        }
+        if let Some(round) = state["round"].as_i64() {
+            self.state.shop.round = round as i32;
+        }
+        if let Some(lives) = state["lives"].as_i64() {
+            self.state.lives = lives as i32;
+        }
+        if let Some(wins) = state["wins"].as_i64() {
+            self.state.wins = wins as i32;
+        }
+
+        // Rebuild bag from JSON bag array
+        self.state.bag.clear();
+        if let Some(bag) = state["bag"].as_array() {
+            for entry in bag {
+                let count = entry["count"].as_u64().unwrap_or(0) as usize;
+                if let Some(card_id_val) = entry["card_id"].as_u64() {
+                    let cid = CardId(card_id_val as u32);
+                    for _ in 0..count {
+                        self.state.bag.push(cid);
+                    }
+                }
+            }
+        }
+
+        self.reset_turn();
+        Ok(())
+    }
+
     // ── Legacy JSON API (for play.py and debugging) ──
 
     fn reset(&mut self, seed: u64, set_id: Option<u32>) -> PyResult<String> {
@@ -616,6 +692,35 @@ impl GameSession {
             }
         }
         board.into_iter().flatten().collect()
+    }
+}
+
+impl GameSession {
+    /// Find a CardId from a JSON card entry by matching id or name.
+    fn find_card_id_from_json(&self, entry: &serde_json::Value) -> Option<CardId> {
+        // Try direct card_id field first
+        if let Some(id) = entry["card_id"].as_u64() {
+            let cid = CardId(id as u32);
+            if self.state.shop.card_pool.contains_key(&cid) {
+                return Some(cid);
+            }
+        }
+        // Try "id" field (from CardView serialization)
+        if let Some(id) = entry["id"].as_u64() {
+            let cid = CardId(id as u32);
+            if self.state.shop.card_pool.contains_key(&cid) {
+                return Some(cid);
+            }
+        }
+        // Try matching by name
+        if let Some(name) = entry["name"].as_str() {
+            for (cid, card) in &self.state.shop.card_pool {
+                if card.name == name {
+                    return Some(*cid);
+                }
+            }
+        }
+        None
     }
 }
 

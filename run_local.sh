@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Run the trained OAB bot against a local server (no blockchain needed).
+# Run the trained OAB bot against a local blockchain node.
+#
+# Requires a local node running at ws://127.0.0.1:9944
 #
 # Usage:
-#   ./run_local.sh                          # defaults: 1 game
+#   ./run_local.sh                          # defaults: //Alice, 1 game
 #   ./run_local.sh --games 5                # play 5 games
 #   ./run_local.sh --model models/oab_v4_5m # different model
 #   ./run_local.sh --set 1                  # use card set 1
@@ -15,6 +17,8 @@ SERVER_DIR="$SCRIPT_DIR/server"
 SERVER_BIN="$SERVER_DIR/target/release/oab-server"
 
 # ── Defaults ──
+RPC_URL="ws://127.0.0.1:9944"
+KEY="//Alice"
 MODEL="models/oab_agent"
 GAMES=1
 SET_ID=0
@@ -24,6 +28,8 @@ QUIET=""
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --rpc)      RPC_URL="$2"; shift 2 ;;
+        --key)      KEY="$2"; shift 2 ;;
         --model)    MODEL="$2"; shift 2 ;;
         --games)    GAMES="$2"; shift 2 ;;
         --set)      SET_ID="$2"; shift 2 ;;
@@ -33,10 +39,12 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: ./run_local.sh [OPTIONS]"
             echo ""
             echo "Options:"
+            echo "  --rpc <URL>      Local node RPC endpoint (default: ws://127.0.0.1:9944)"
+            echo "  --key <SURI>     Signing key (default: //Alice)"
             echo "  --model <PATH>   Model path (default: models/oab_agent)"
             echo "  --games <N>      Number of games (default: 1)"
             echo "  --set <N>        Card set ID (default: 0)"
-            echo "  --port <N>       Local server port (default: 3030)"
+            echo "  --port <N>       Server port (default: 3030)"
             echo "  --quiet          Suppress per-round output"
             echo "  --help           Show this help"
             exit 0
@@ -68,14 +76,20 @@ if [[ ! -f "$SERVER_BIN" ]]; then
     (cd "$SERVER_DIR" && cargo build --release)
 fi
 
-# ── Start local server ──
+# ── Fund account ──
+echo "Funding account ($KEY)..."
+"$SERVER_BIN" --url "$RPC_URL" --key "$KEY" --fund "$KEY" 2>&1 | grep -v "^$"
+
+# ── Start server ──
 SERVER_LOG="$SCRIPT_DIR/.server.log"
-echo "Starting local server (port $PORT, set $SET_ID)..."
-"$SERVER_BIN" --port "$PORT" --set "$SET_ID" >"$SERVER_LOG" 2>&1 &
+echo ""
+echo "Starting server (local chain, port $PORT)..."
+"$SERVER_BIN" --url "$RPC_URL" --key "$KEY" --port "$PORT" --set "$SET_ID" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be ready
-for i in $(seq 1 15); do
+echo "Waiting for server..."
+for i in $(seq 1 30); do
     if curl -s "http://localhost:$PORT/cards" >/dev/null 2>&1; then
         echo "Server ready."
         break
@@ -93,7 +107,7 @@ echo ""
 source "$SCRIPT_DIR/.venv/bin/activate"
 python "$SCRIPT_DIR/play.py" \
     --url "http://localhost:$PORT" \
-    --local \
     --model "$MODEL" \
+    --set "$SET_ID" \
     --games "$GAMES" \
     $QUIET
