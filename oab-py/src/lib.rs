@@ -380,6 +380,9 @@ impl GameSession {
         if let Some(wins) = state["wins"].as_i64() {
             self.state.wins = wins as i32;
         }
+        if let Some(seed) = state["game_seed"].as_u64() {
+            self.state.shop.game_seed = seed;
+        }
 
         // Rebuild bag from JSON bag array
         self.state.bag.clear();
