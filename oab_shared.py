@@ -290,3 +290,8 @@ class MatchedPool:
     def __len__(self):
         with self._lock:
             return sum(len(b) for b in self._pool.values())
+
+    def snapshot(self):
+        """Return {(round, wins, lives): count} for dashboard histograms."""
+        with self._lock:
+            return {key: len(boards) for key, boards in self._pool.items()}

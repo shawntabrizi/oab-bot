@@ -70,6 +70,7 @@ def run_evaluation(model, config, num_games, shared_pool=False):
             reorder_penalty=config.reorder_penalty,
             board_unit_reward=config.board_unit_reward,
             empty_board_penalty=config.empty_board_penalty,
+            wasteful_burn_penalty=config.wasteful_burn_penalty,
             phase_decomposition=config.phase_decomposition,
             shop_action_limit=config.shop_action_limit,
             position_action_limit=config.position_action_limit,

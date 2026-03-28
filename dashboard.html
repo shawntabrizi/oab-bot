@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OAB Training Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; font-size: 13px; }
+  .header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 16px; font-weight: 600; color: #58a6ff; }
+  .status { font-size: 12px; padding: 4px 10px; border-radius: 12px; }
+  .status.connected { background: #238636; color: #fff; }
+  .status.disconnected { background: #da3633; color: #fff; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto 1fr; gap: 1px; background: #30363d; height: calc(100vh - 85px); }
+  .panel { background: #0d1117; padding: 16px; overflow: hidden; display: flex; flex-direction: column; }
+  .panel-title { font-size: 12px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .stats-row { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 12px; }
+  .stat { text-align: center; }
+  .stat-value { font-size: 22px; font-weight: 700; color: #58a6ff; }
+  .stat-label { font-size: 10px; color: #8b949e; text-transform: uppercase; }
+  .chart-wrap { flex: 1; min-height: 0; position: relative; }
+  .feed { flex: 1; overflow-y: auto; min-height: 0; }
+  .feed-item { padding: 4px 8px; border-bottom: 1px solid #21262d; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+  .feed-item:hover { background: #161b22; }
+  .feed-item.selected { background: #1c2534; border-left: 2px solid #58a6ff; }
+  .env-badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; min-width: 20px; text-align: center; }
+  .victory { color: #3fb950; }
+  .defeat { color: #f85149; }
+  .draw { color: #d29922; }
+  .action-tag { color: #79c0ff; }
+  .round-tag { color: #8b949e; font-size: 11px; }
+  .detail-panel { flex: 1; overflow-y: auto; min-height: 0; }
+  .detail-section { margin-bottom: 16px; }
+  .detail-section h3 { font-size: 11px; color: #8b949e; text-transform: uppercase; margin-bottom: 6px; }
+  .detail-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin-bottom: 4px; }
+  .board-grid { display: flex; gap: 6px; flex-wrap: wrap; }
+  .unit { background: #21262d; border: 1px solid #30363d; border-radius: 4px; padding: 6px 10px; font-size: 12px; }
+  .unit .atk { color: #f85149; font-weight: 600; }
+  .unit .hp { color: #3fb950; font-weight: 600; }
+  .action-list { list-style: none; }
+  .action-list li { padding: 3px 0; border-bottom: 1px solid #21262d; }
+  .action-list li:last-child { border-bottom: none; }
+  .empty-state { color: #484f58; text-align: center; padding: 40px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+  .tab { padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; background: #21262d; color: #8b949e; }
+  .tab.active { background: #30363d; color: #c9d1d9; }
+  .progress-wrap { padding: 8px 20px; background: #161b22; border-bottom: 1px solid #30363d; }
+  .progress-outer { background: #21262d; border-radius: 4px; height: 20px; overflow: hidden; position: relative; }
+  .progress-inner { background: linear-gradient(90deg, #238636, #3fb950); height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+  .progress-text { position: absolute; top: 0; left: 0; right: 0; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: #c9d1d9; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>OAB Training Dashboard</h1>
+  <span id="connStatus" class="status disconnected">Disconnected</span>
+</div>
+
+<div class="progress-wrap">
+  <div class="progress-outer">
+    <div class="progress-inner" id="progressBar" style="width: 0%"></div>
+    <div class="progress-text" id="progressText">0 / 0 steps (0%)</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Top left: Stats + Pool histogram -->
+  <div class="panel">
+    <div class="panel-title">Training Progress</div>
+    <div class="stats-row">
+      <div class="stat"><div class="stat-value" id="sGames">0</div><div class="stat-label">Games</div></div>
+      <div class="stat"><div class="stat-value victory" id="sVictories">0</div><div class="stat-label">Victories</div></div>
+      <div class="stat"><div class="stat-value defeat" id="sDefeats">0</div><div class="stat-label">Defeats</div></div>
+      <div class="stat"><div class="stat-value" id="sWinRate">0%</div><div class="stat-label">Win Rate</div></div>
+      <div class="stat"><div class="stat-value" id="sRounds">0</div><div class="stat-label">Rounds</div></div>
+      <div class="stat"><div class="stat-value" id="sPool">0</div><div class="stat-label">Pool Boards</div></div>
+    </div>
+    <div class="panel-title">Board Pool by Round</div>
+    <div class="tabs">
+      <div class="tab active" data-view="round" onclick="switchPoolView('round')">By Round</div>
+      <div class="tab" data-view="wins" onclick="switchPoolView('wins')">By Wins</div>
+      <div class="tab" data-view="lives" onclick="switchPoolView('lives')">By Lives</div>
+    </div>
+    <div class="chart-wrap"><canvas id="poolChart"></canvas></div>
+  </div>
+
+  <!-- Top right: Win rate over time -->
+  <div class="panel">
+    <div class="panel-title">Win Rate Over Time</div>
+    <div class="chart-wrap"><canvas id="winChart"></canvas></div>
+  </div>
+
+  <!-- Bottom left: Activity feed -->
+  <div class="panel">
+    <div class="panel-title">Live Activity</div>
+    <div class="feed" id="feed"></div>
+  </div>
+
+  <!-- Bottom right: Drill-down -->
+  <div class="panel">
+    <div class="panel-title">Round Detail</div>
+    <div class="detail-panel" id="detail">
+      <div class="empty-state">Click a round in the activity feed to inspect it</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ENV_COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#79c0ff','#56d364','#e3b341','#ff7b72','#d2a8ff'];
+const MAX_FEED = 300;
+const MAX_WIN_POINTS = 200;
+
+let ws, poolChart, winChart;
+let feedItems = [];
+let poolView = 'round';
+let poolData = {};
+let winHistory = [];
+let gameCounter = 0;
+
+// ── Charts ──
+
+function initCharts() {
+  const poolCtx = document.getElementById('poolChart').getContext('2d');
+  poolChart = new Chart(poolCtx, {
+    type: 'bar',
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
+        y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' }, beginAtZero: true },
+      },
+    },
+  });
+
+  const winCtx = document.getElementById('winChart').getContext('2d');
+  winChart = new Chart(winCtx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Win Rate %',
+        data: [],
+        borderColor: '#3fb950',
+        backgroundColor: 'rgba(63,185,80,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8b949e', maxTicksLimit: 10 }, grid: { color: '#21262d' } },
+        y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' }, min: 0, max: 100, beginAtZero: true },
+      },
+    },
+  });
+}
+
+function updatePoolChart() {
+  const buckets = {};
+  for (const [key, count] of Object.entries(poolData)) {
+    const [r, w, l] = key.split(',').map(Number);
+    let groupKey;
+    if (poolView === 'round') groupKey = r;
+    else if (poolView === 'wins') groupKey = w;
+    else groupKey = l;
+    buckets[groupKey] = (buckets[groupKey] || 0) + count;
+  }
+
+  const sortedKeys = Object.keys(buckets).map(Number).sort((a, b) => a - b);
+  const prefix = poolView === 'round' ? 'R' : poolView === 'wins' ? 'W' : 'L';
+  poolChart.data.labels = sortedKeys.map(k => prefix + k);
+  poolChart.data.datasets = [{
+    data: sortedKeys.map(k => buckets[k]),
+    backgroundColor: '#58a6ff',
+    borderRadius: 2,
+  }];
+  poolChart.update('none');
+
+  const total = Object.values(buckets).reduce((a, b) => a + b, 0);
+  document.getElementById('sPool').textContent = total.toLocaleString();
+}
+
+function switchPoolView(view) {
+  poolView = view;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+  updatePoolChart();
+}
+
+function updateWinChart(stats) {
+  if (stats.games === 0) return;
+  const rate = (stats.victories / stats.games * 100).toFixed(1);
+
+  if (stats.games > gameCounter) {
+    gameCounter = stats.games;
+    winHistory.push({ game: stats.games, rate: parseFloat(rate) });
+    if (winHistory.length > MAX_WIN_POINTS) winHistory.shift();
+
+    winChart.data.labels = winHistory.map(p => p.game);
+    winChart.data.datasets[0].data = winHistory.map(p => p.rate);
+    winChart.update('none');
+  }
+}
+
+// ── Activity Feed ──
+
+function addFeedItem(event) {
+  if (event.type !== 'end_turn') return;
+
+  const item = document.createElement('div');
+  item.className = 'feed-item';
+  item.dataset.eventJson = JSON.stringify(event);
+  item.onclick = () => showDetail(event, item);
+
+  const badge = document.createElement('span');
+  badge.className = 'env-badge';
+  badge.style.background = ENV_COLORS[event.env_id % ENV_COLORS.length];
+  badge.style.color = '#0d1117';
+  badge.textContent = event.env_id;
+
+  const roundTag = document.createElement('span');
+  roundTag.className = 'round-tag';
+  roundTag.textContent = 'R' + event.round;
+
+  const text = document.createElement('span');
+  const br = event.battle_result || '';
+  const resultClass = br === 'Victory' ? 'victory' : br === 'Defeat' ? 'defeat' : 'draw';
+  let line = `<span class="${resultClass}">${br}</span>`;
+  line += ` W:${event.wins} L:${event.lives}`;
+  line += ` (${event.board_units} units)`;
+  if (event.game_result) {
+    line += ` <b>${event.game_result.toUpperCase()}</b>`;
+  }
+  const nActions = (event.actions || []).length;
+  if (nActions > 0) line += ` [${nActions} actions]`;
+  text.innerHTML = line;
+
+  item.appendChild(badge);
+  item.appendChild(roundTag);
+  item.appendChild(text);
+
+  const feed = document.getElementById('feed');
+  feed.prepend(item);
+  feedItems.unshift(item);
+  while (feedItems.length > MAX_FEED) {
+    const old = feedItems.pop();
+    old.remove();
+  }
+}
+
+// ── Detail Panel ──
+
+function showDetail(event, item) {
+  document.querySelectorAll('.feed-item.selected').forEach(el => el.classList.remove('selected'));
+  if (item) item.classList.add('selected');
+
+  const detail = document.getElementById('detail');
+  let html = '';
+
+  // Battle result header
+  const resultClass = event.battle_result === 'Victory' ? 'victory' : event.battle_result === 'Defeat' ? 'defeat' : 'draw';
+  html += `<div class="detail-section"><div class="detail-card">
+    <b>Env ${event.env_id} — Round ${event.round}</b> &nbsp;
+    <span class="${resultClass}">${event.battle_result}</span> &nbsp;
+    Wins: ${event.wins} &nbsp; Lives: ${event.lives} &nbsp;
+    Reward: ${(event.reward || 0).toFixed(2)}
+    ${event.game_result ? `<br><b style="color:${event.game_result==='victory'?'#3fb950':'#f85149'}">${event.game_result.toUpperCase()}</b>` : ''}
+  </div></div>`;
+
+  // Actions taken
+  const actions = event.actions || [];
+  if (actions.length > 0) {
+    html += `<div class="detail-section"><h3>Actions (${actions.length})</h3><ul class="action-list">`;
+    for (const a of actions) {
+      let desc = `<span class="action-tag">${a.action}</span>`;
+      if (a.card) desc += ` ${a.card}`;
+      if (a.params) {
+        const p = a.params;
+        if (p.hand_index !== undefined) desc += ` hand[${p.hand_index}]`;
+        if (p.board_slot !== undefined) desc += ` → slot ${p.board_slot}`;
+        if (p.from_slot !== undefined) desc += ` slot ${p.from_slot}`;
+        if (p.to_slot !== undefined) desc += ` → slot ${p.to_slot}`;
+      }
+      desc += ` <span style="color:#8b949e">(${(a.reward||0).toFixed(3)})</span>`;
+      html += `<li>${desc}</li>`;
+    }
+    html += `</ul></div>`;
+  }
+
+  // Board
+  const board = event.board || [];
+  html += `<div class="detail-section"><h3>Board (${board.length} units)</h3><div class="board-grid">`;
+  if (board.length === 0) {
+    html += '<span style="color:#484f58">Empty board</span>';
+  }
+  for (const u of board) {
+    html += `<div class="unit">Slot ${u.slot} #${u.card_id} <span class="atk">${u.attack||'?'}⚔</span> <span class="hp">${u.health||'?'}♥</span></div>`;
+  }
+  html += '</div></div>';
+
+  // Opponent
+  const opp = event.opponent || [];
+  html += `<div class="detail-section"><h3>Opponent (${opp.length} units)</h3><div class="board-grid">`;
+  if (opp.length === 0) {
+    html += '<span style="color:#484f58">Empty / no opponent</span>';
+  }
+  for (const u of opp) {
+    html += `<div class="unit">Slot ${u.slot} #${u.card_id} <span class="atk">${u.attack||'?'}⚔</span> <span class="hp">${u.health||'?'}♥</span></div>`;
+  }
+  html += '</div></div>';
+
+  detail.innerHTML = html;
+}
+
+// ── Stats ──
+
+function updateStats(stats) {
+  document.getElementById('sGames').textContent = stats.games.toLocaleString();
+  document.getElementById('sVictories').textContent = stats.victories.toLocaleString();
+  document.getElementById('sDefeats').textContent = stats.defeats.toLocaleString();
+  document.getElementById('sRounds').textContent = stats.total_rounds.toLocaleString();
+  const rate = stats.games > 0 ? (stats.victories / stats.games * 100).toFixed(1) + '%' : '0%';
+  document.getElementById('sWinRate').textContent = rate;
+  updateWinChart(stats);
+
+  // Progress bar
+  const cur = stats.timesteps || 0;
+  const total = stats.total_timesteps || 0;
+  if (total > 0) {
+    const pct = Math.min(100, cur / total * 100);
+    document.getElementById('progressBar').style.width = pct.toFixed(1) + '%';
+    document.getElementById('progressText').textContent =
+      `${cur.toLocaleString()} / ${total.toLocaleString()} steps (${pct.toFixed(1)}%)`;
+  } else {
+    document.getElementById('progressText').textContent = `${cur.toLocaleString()} steps`;
+  }
+}
+
+// ── WebSocket ──
+
+function connect() {
+  const loc = window.location;
+  const wsUrl = `ws://${loc.host}/ws`;
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    document.getElementById('connStatus').textContent = 'Connected';
+    document.getElementById('connStatus').className = 'status connected';
+  };
+
+  ws.onclose = () => {
+    document.getElementById('connStatus').textContent = 'Disconnected';
+    document.getElementById('connStatus').className = 'status disconnected';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onmessage = (msg) => {
+    const data = JSON.parse(msg.data);
+
+    if (data.pool) {
+      poolData = data.pool;
+      updatePoolChart();
+    }
+
+    if (data.stats) {
+      updateStats(data.stats);
+    }
+
+    if (data.events) {
+      for (const event of data.events) {
+        addFeedItem(event);
+      }
+    }
+  };
+}
+
+// ── Init ──
+
+initCharts();
+connect();
+</script>
+</body>
+</html>

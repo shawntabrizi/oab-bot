@@ -35,8 +35,8 @@ echo ""
 # Build the server
 echo "Building oab-server..."
 cd "$PROJECT_DIR"
-cd server && cargo build --release 2>&1 | tail -1
-OAB_SERVER="$PROJECT_DIR/server/target/release/oab-server"
+cargo build -p oab-server --release 2>&1 | tail -1
+OAB_SERVER="$PROJECT_DIR/target/release/oab-server"
 
 # Collect all derived account SURIs that need funding
 FUND_ARGS=()

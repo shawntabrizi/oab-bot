@@ -20,22 +20,24 @@ class TrainConfig:
     n_epochs: int = 10
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    ent_coef: float = 0.5
+    ent_coef: float = 0.02
 
     # Reward shaping
     action_cost: float = -0.01
     repeat_penalty: float = -0.1
-    play_reward: float = 0.05
+    play_reward: float = 0.08
     reorder_penalty: float = -0.05
     board_unit_reward: float = 0.03
     empty_board_penalty: float = -0.2
+    wasteful_burn_penalty: float = -0.03
 
     # Self-play
     lobby_size: int = 10
     max_boards_per_bucket: int = 50
     challenge_probability: float = 0.35
-    seed_games_per_model: int = 8
+    seed_games_per_model: int = 1000
     seed_opponent_models: list[str] = dataclasses.field(default_factory=list)
+    seed_script_bots: bool = True
 
     # Optional phase decomposition
     phase_decomposition: bool = False

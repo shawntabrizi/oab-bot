@@ -143,7 +143,7 @@ mod inner {
                     let _ = self.rt.block_on(submit_extrinsic(
                         &self.api,
                         &self.keypair,
-                        "AutoBattle",
+                        "OabArena",
                         "end_game",
                         vec![],
                     ));
@@ -152,7 +152,7 @@ mod inner {
                     let _ = self.rt.block_on(submit_extrinsic(
                         &self.api,
                         &self.keypair,
-                        "AutoBattle",
+                        "OabArena",
                         "abandon_game",
                         vec![],
                     ));
@@ -171,7 +171,7 @@ mod inner {
                 .block_on(submit_extrinsic(
                     &self.api,
                     &self.keypair,
-                    "AutoBattle",
+                    "OabArena",
                     "start_game",
                     vec![("set_id", Value::u128(set_id as u128))],
                 ))
@@ -298,7 +298,7 @@ mod inner {
                 let _ = self.rt.block_on(submit_extrinsic(
                     &self.api,
                     &self.keypair,
-                    "AutoBattle",
+                    "OabArena",
                     "end_game",
                     vec![],
                 ));
@@ -423,7 +423,7 @@ mod inner {
         keypair: &Keypair,
         action_value: Value,
     ) -> Result<Option<(u64, Vec<(u32, i32, i32)>)>, String> {
-        let tx = subxt::dynamic::tx("AutoBattle", "submit_turn", vec![("action", action_value)]);
+        let tx = subxt::dynamic::tx("OabArena", "submit_turn", vec![("action", action_value)]);
 
         let mut progress = api
             .tx()
@@ -443,7 +443,7 @@ mod inner {
                     // Find BattleReported event
                     for event in events.iter() {
                         let event = event.map_err(|e| format!("Event decode error: {}", e))?;
-                        if event.pallet_name() == "AutoBattle"
+                        if event.pallet_name() == "OabArena"
                             && event.variant_name() == "BattleReported"
                         {
                             let bytes = event.field_bytes();
@@ -536,7 +536,7 @@ mod inner {
     ) -> Result<Option<GameSession>, String> {
         let raw = fetch_raw_storage(
             api,
-            "AutoBattle",
+            "OabArena",
             "ActiveGame",
             vec![Value::from_bytes(account_id.0)],
         )
@@ -567,7 +567,7 @@ mod inner {
             .at_latest()
             .await
             .map_err(|e| format!("Storage error: {}", e))?;
-        let address = subxt::dynamic::storage("AutoBattle", "UserCards", ());
+        let address = subxt::dynamic::storage("OabCardRegistry", "UserCards", ());
         let mut iter = storage
             .iter(address)
             .await
@@ -591,7 +591,7 @@ mod inner {
         }
 
         // Load card names
-        let meta_address = subxt::dynamic::storage("AutoBattle", "CardMetadataStore", ());
+        let meta_address = subxt::dynamic::storage("OabCardRegistry", "CardMetadataStore", ());
         let mut meta_iter = storage
             .iter(meta_address)
             .await
@@ -664,7 +664,7 @@ mod inner {
             .at_latest()
             .await
             .map_err(|e| format!("Storage error: {}", e))?;
-        let address = subxt::dynamic::storage("AutoBattle", "CardSets", ());
+        let address = subxt::dynamic::storage("OabCardRegistry", "CardSets", ());
         let mut iter = storage
             .iter(address)
             .await

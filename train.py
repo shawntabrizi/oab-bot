@@ -14,6 +14,8 @@ Usage:
 """
 
 import argparse
+import importlib.util
+import json
 import os
 
 import torch
@@ -23,12 +25,13 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+import oab_py
 from config import TrainConfig, load_config, load_saved_model_config, save_config
 from env import OABEnv
 from oab_shared import MatchedPool
 
 
-def build_env(config, board_pool):
+def build_env(config, board_pool, collector=None, env_id=0):
     """Create a concrete OABEnv from config."""
     return OABEnv(
         set_id=config.set_id,
@@ -39,17 +42,20 @@ def build_env(config, board_pool):
         reorder_penalty=config.reorder_penalty,
         board_unit_reward=config.board_unit_reward,
         empty_board_penalty=config.empty_board_penalty,
+        wasteful_burn_penalty=config.wasteful_burn_penalty,
         phase_decomposition=config.phase_decomposition,
         shop_action_limit=config.shop_action_limit,
         position_action_limit=config.position_action_limit,
         max_rounds=config.max_rounds,
+        collector=collector,
+        env_id=env_id,
     )
 
 
-def make_env(config, board_pool):
+def make_env(config, board_pool, collector=None, env_id=0):
     """Factory for creating an OABEnv with shared board pool and config."""
     def _init():
-        return build_env(config, board_pool)
+        return build_env(config, board_pool, collector, env_id)
     return _init
 
 
@@ -86,6 +92,68 @@ def seed_pool_from_models(train_config, board_pool):
         )
 
 
+SCRIPT_DIR = os.path.join(os.path.dirname(__file__), "scripts", "agents")
+SCRIPT_BOTS = [
+    ("Greedy",  "greedy.py"),
+    ("Aggro",   "aggro.py"),
+    ("Tank",    "tank.py"),
+    ("Economy", "economy.py"),
+]
+
+
+def _load_decide_fn(script_name):
+    path = os.path.join(SCRIPT_DIR, script_name)
+    spec = importlib.util.spec_from_file_location(script_name.replace(".py", ""), path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.decide
+
+
+def seed_pool_from_scripts(train_config, board_pool):
+    """Run scripted bots locally and inject their boards into the pool.
+
+    Each bot plays seed_games_per_model games. Boards are added to the
+    shared pool after each shopping phase so the RL agent trains against
+    diverse hand-crafted strategies from round 1.
+    """
+    for name, script_file in SCRIPT_BOTS:
+        decide_fn = _load_decide_fn(script_file)
+        boards_before = len(board_pool)
+
+        for game_idx in range(train_config.seed_games_per_model):
+            session = oab_py.GameSession(game_idx, train_config.set_id)
+            session.set_max_rounds(train_config.max_rounds)
+
+            while True:
+                state = json.loads(session.get_state())
+                actions = decide_fn(state)
+                try:
+                    session.shop(json.dumps(actions))
+                except Exception:
+                    session.shop("[]")
+
+                board = json.loads(session.get_board_as_opponent())
+                rnd = state["round"]
+                wins = state["wins"]
+                lives = state["lives"]
+
+                # Sample opponent from pool (cross-pollination between bots)
+                opponent = board_pool.sample(rnd, wins, lives, exclude_board=board)
+                opponent_json = json.dumps(opponent) if opponent else "[]"
+                if board:
+                    board_pool.add(rnd, wins, lives, board)
+
+                result = json.loads(session.battle(opponent_json))
+                if result["game_over"]:
+                    break
+
+        boards_after = len(board_pool)
+        print(
+            f"  Seeded pool from {name}: "
+            f"+{boards_after - boards_before} boards ({boards_after} total)"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train OAB RL agent with self-play")
     parser.add_argument("--config", default=None,
@@ -118,12 +186,16 @@ def main():
                         help="Reward granted per occupied board slot when ending the turn")
     parser.add_argument("--empty-board-penalty", type=float, default=None,
                         help="Penalty applied when ending the turn with an empty board")
+    parser.add_argument("--wasteful-burn-penalty", type=float, default=None,
+                        help="Penalty for burning a card when the board has empty slots")
     parser.add_argument("--challenge-probability", type=float, default=None,
                         help="Chance to sample a stronger same-round challenger over an exact match")
     parser.add_argument("--seed-games-per-model", type=int, default=None,
                         help="How many deterministic games to use when seeding the pool per model")
     parser.add_argument("--seed-opponent-model", action="append", default=None,
                         help="Historical model to pre-seed the opponent pool from; repeatable")
+    parser.add_argument("--seed-script-bots", action="store_true",
+                        help="Pre-seed the opponent pool by running scripted bot personalities")
     args = parser.parse_args()
 
     # Prefer the saved model config when resuming unless the caller supplied a config file.
@@ -157,12 +229,16 @@ def main():
         config.board_unit_reward = args.board_unit_reward
     if args.empty_board_penalty is not None:
         config.empty_board_penalty = args.empty_board_penalty
+    if args.wasteful_burn_penalty is not None:
+        config.wasteful_burn_penalty = args.wasteful_burn_penalty
     if args.challenge_probability is not None:
         config.challenge_probability = args.challenge_probability
     if args.seed_games_per_model is not None:
         config.seed_games_per_model = args.seed_games_per_model
     if args.seed_opponent_model is not None:
         config.seed_opponent_models = args.seed_opponent_model
+    if args.seed_script_bots:
+        config.seed_script_bots = True
 
     os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
     os.makedirs(config.log_dir, exist_ok=True)
@@ -171,11 +247,20 @@ def main():
         max_per_bucket=config.max_boards_per_bucket,
         challenge_probability=config.challenge_probability,
     )
+    if config.seed_script_bots:
+        print("Seeding shared pool from scripted bots:")
+        seed_pool_from_scripts(config, board_pool)
     if config.seed_opponent_models:
         print("Seeding shared pool from historical models:")
         seed_pool_from_models(config, board_pool)
 
-    env_fns = [make_env(config, board_pool) for _ in range(config.lobby_size)]
+    # Start live dashboard
+    from dashboard import DashboardCollector, start_dashboard
+    collector = DashboardCollector(total_timesteps=config.timesteps)
+    start_dashboard(collector, board_pool)
+
+    env_fns = [make_env(config, board_pool, collector, env_id=i)
+               for i in range(config.lobby_size)]
     vec_env = DummyVecEnv(env_fns)
 
     if args.resume:
@@ -195,7 +280,7 @@ def main():
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
             ent_coef=config.ent_coef,
-            policy_kwargs=dict(net_arch=[256, 128]),
+            policy_kwargs=dict(net_arch=[512, 256]),
         )
 
     checkpoint_cb = CheckpointCallback(
@@ -212,12 +297,18 @@ def main():
         "  Rewards: "
         f"action {config.action_cost}, repeat {config.repeat_penalty}, "
         f"play +{config.play_reward}, reorder {config.reorder_penalty}, "
-        f"board +{config.board_unit_reward}/unit, empty {config.empty_board_penalty}"
+        f"board +{config.board_unit_reward}/unit, empty {config.empty_board_penalty}, "
+        f"wasteful burn {config.wasteful_burn_penalty}"
     )
     print(
         f"  Pool: matched (max {config.max_boards_per_bucket}/bucket, "
         f"challenge {config.challenge_probability:.2f})"
     )
+    if config.seed_script_bots:
+        print(
+            f"  Script bot seeding: {len(SCRIPT_BOTS)} bots, "
+            f"{config.seed_games_per_model} games/bot"
+        )
     if config.seed_opponent_models:
         print(
             f"  Historical seeding: {len(config.seed_opponent_models)} model(s), "

@@ -31,19 +31,25 @@ class OABEnv(gym.Env):
                  reorder_penalty=-0.05,
                  board_unit_reward=0.03,
                  empty_board_penalty=-0.2,
+                 wasteful_burn_penalty=-0.1,
                  phase_decomposition=False,
                  shop_action_limit=10,
                  position_action_limit=5,
-                 max_rounds=20):
+                 max_rounds=20,
+                 collector=None, env_id=0):
         super().__init__()
         self.set_id = set_id
         self.board_pool = board_pool
+        self.collector = collector
+        self.env_id = env_id
+        self._turn_actions = []
         self.action_cost = action_cost
         self.repeat_penalty = repeat_penalty
         self.play_reward = play_reward
         self.reorder_penalty = reorder_penalty
         self.board_unit_reward = board_unit_reward
         self.empty_board_penalty = empty_board_penalty
+        self.wasteful_burn_penalty = wasteful_burn_penalty
         self.max_rounds = max_rounds
         self.phase_controller = PhaseController(
             enabled=phase_decomposition,
@@ -68,11 +74,17 @@ class OABEnv(gym.Env):
         self._session = oab_py.GameSession(game_seed, self.set_id)
         self._session.set_max_rounds(self.max_rounds)
         self.phase_controller.reset()
+        self._turn_actions = []
+        if self.collector:
+            self.collector.emit("game_start", self.env_id,
+                                hand=self.get_hand_names())
         obs = self._get_observation()
         return obs, self._make_info()
 
     def step(self, action):
         action = int(action)
+        if self.collector:
+            self.collector.inc_steps()
 
         if self.phase_controller.is_phase_transition_action(action):
             self.phase_controller.advance_to_position()
@@ -81,12 +93,24 @@ class OABEnv(gym.Env):
         if action == 0:  # EndTurn
             return self._do_end_turn()
 
-        action_type, _ = self.describe_action(action)
+        action_type, params = self.describe_action(action)
 
         # Apply action locally in Rust
         changed = self._session.apply_action(action)
         self.phase_controller.record_action(action)
         reward = self._action_reward(action_type, changed)
+
+        if self.collector and changed:
+            card_name = None
+            if action_type in ("PlayFromHand", "BurnFromHand"):
+                idx = params.get("hand_index")
+                hand = self.get_hand_names()
+                if idx is not None and idx < len(hand):
+                    card_name = hand[idx]
+            self._turn_actions.append({
+                "action": action_type, "card": card_name,
+                "params": params, "reward": reward,
+            })
 
         obs = self._get_observation()
         return obs, reward, False, False, self._make_info()
@@ -117,6 +141,7 @@ class OABEnv(gym.Env):
                 self.board_pool.add(rnd, wins, lives, board)
         else:
             opponent_json = "[]"
+            opponent = []
 
         reward, terminated, info_json = self._session.commit_turn_and_battle(opponent_json)
         end_turn_reward = self._end_turn_reward(board_units)
@@ -126,6 +151,18 @@ class OABEnv(gym.Env):
         info = json.loads(info_json)
         info["board_units"] = board_units
         info["end_turn_reward"] = end_turn_reward
+
+        if self.collector:
+            self.collector.emit("end_turn", self.env_id,
+                                round=rnd, lives=info.get("lives"), wins=info.get("wins"),
+                                board=board, opponent=opponent,
+                                board_units=board_units,
+                                battle_result=info.get("battle_result"),
+                                game_result=info.get("game_result"),
+                                reward=reward, terminated=terminated,
+                                actions=self._turn_actions,
+                                hand=self.get_hand_names() if not terminated else [])
+            self._turn_actions = []
 
         return obs, reward, terminated, False, info
 
@@ -139,6 +176,11 @@ class OABEnv(gym.Env):
         reward = self.action_cost
         if action_type == "PlayFromHand":
             reward += self.play_reward
+        elif action_type == "BurnFromHand" and self.wasteful_burn_penalty != 0:
+            board_names = self.get_board_names()
+            board_full = all(n is not None for n in board_names)
+            if not board_full:
+                reward += self.wasteful_burn_penalty
         return reward
 
     def _end_turn_reward(self, board_units):
