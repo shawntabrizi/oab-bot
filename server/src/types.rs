@@ -1,7 +1,9 @@
 //! HTTP API request/response types.
 
 use oab_battle::battle::CombatEvent;
-use oab_battle::types::CommitTurnAction;
+use oab_battle::types::{
+    CommitTurnAction, IndexValue, ManaValue, RarityValue, RoundValue, SetIdValue, StatValue,
+};
 use oab_game::view::{BoardUnitView, CardView, GameView};
 use serde::{Deserialize, Serialize};
 
@@ -10,13 +12,13 @@ use serde::{Deserialize, Serialize};
 /// Game state returned by POST /reset and POST /step.
 #[derive(Debug, Serialize)]
 pub struct GameStateResponse {
-    pub round: i32,
-    pub lives: i32,
-    pub wins: i32,
-    pub mana: i32,
-    pub mana_limit: i32,
+    pub round: RoundValue,
+    pub lives: RoundValue,
+    pub wins: RoundValue,
+    pub mana: ManaValue,
+    pub mana_limit: ManaValue,
     pub phase: String,
-    pub bag_count: u32,
+    pub bag_count: IndexValue,
     pub hand: Vec<Option<CardView>>,
     pub board: Vec<Option<BoardUnitView>>,
     pub can_afford: Vec<bool>,
@@ -46,7 +48,7 @@ impl From<GameView> for GameStateResponse {
 #[derive(Debug, Serialize)]
 pub struct StepResponse {
     /// The round number this battle was for
-    pub completed_round: i32,
+    pub completed_round: RoundValue,
     /// The battle result: "Victory", "Defeat", or "Draw"
     pub battle_result: String,
     /// Whether the game is over
@@ -84,19 +86,19 @@ pub struct SetInfo {
 /// A card entry within a set, exposing card_id and rarity weight.
 #[derive(Debug, Serialize)]
 pub struct SetCardEntry {
-    pub card_id: u32,
-    pub rarity: u32,
+    pub card_id: u16,
+    pub rarity: RarityValue,
 }
 
 /// A card entry in the bag summary (grouped by card_id with count).
 #[derive(Debug, Serialize)]
 pub struct BagCardEntry {
-    pub card_id: u32,
+    pub card_id: u16,
     pub name: String,
-    pub attack: i32,
-    pub health: i32,
-    pub play_cost: i32,
-    pub burn_value: i32,
+    pub attack: StatValue,
+    pub health: StatValue,
+    pub play_cost: ManaValue,
+    pub burn_value: ManaValue,
     pub count: u32,
 }
 
@@ -112,15 +114,15 @@ pub struct ErrorResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpponentUnit {
     /// Card ID of the unit
-    pub card_id: u32,
+    pub card_id: u16,
     /// Board slot (0=front, 4=back)
-    pub slot: u32,
+    pub slot: IndexValue,
     /// Permanent attack buff (default: 0)
     #[serde(default)]
-    pub perm_attack: i32,
+    pub perm_attack: StatValue,
     /// Permanent health buff (default: 0)
     #[serde(default)]
-    pub perm_health: i32,
+    pub perm_health: StatValue,
 }
 
 /// POST /reset request body (optional).
@@ -134,7 +136,7 @@ pub struct ResetRequest {
     pub seed: Option<u64>,
     /// Card set ID (default: 0)
     #[serde(default)]
-    pub set_id: Option<u32>,
+    pub set_id: Option<SetIdValue>,
 }
 
 /// POST /shop request body — apply shop actions.
@@ -184,7 +186,7 @@ impl From<StepRequest> for CommitTurnAction {
 pub struct ConstructedCreateRequest {
     pub match_id: String,
     #[serde(default)]
-    pub set_id: Option<u32>,
+    pub set_id: Option<SetIdValue>,
 }
 
 /// POST /constructed/join
@@ -192,7 +194,7 @@ pub struct ConstructedCreateRequest {
 pub struct ConstructedJoinRequest {
     pub match_id: String,
     pub agent_id: String,
-    pub deck: Vec<u32>,
+    pub deck: Vec<u16>,
     #[serde(default)]
     pub seed: Option<u64>,
 }
@@ -217,7 +219,7 @@ pub struct ConstructedBattleRequest {
 #[derive(Debug, Serialize)]
 pub struct ConstructedCreateResponse {
     pub match_id: String,
-    pub set_id: u32,
+    pub set_id: SetIdValue,
 }
 
 /// Response for POST /constructed/battle — results for both players

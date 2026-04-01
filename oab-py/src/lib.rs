@@ -27,8 +27,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use serde_json::json;
 
-const DEFAULT_MAX_ACTIONS_PER_TURN: usize = 15;
-const DEFAULT_MAX_ROUNDS_PER_GAME: i32 = 20;
+const DEFAULT_MAX_ACTIONS_PER_TURN: usize = 10;
+const DEFAULT_MAX_ROUNDS_PER_GAME: RoundValue = 20;
 
 /// A local game session exposed to Python.
 #[pyclass]
@@ -41,7 +41,7 @@ struct GameSession {
     /// Number of actions applied this turn.
     action_count: usize,
     max_actions_per_turn: usize,
-    max_rounds_per_game: i32,
+    max_rounds_per_game: RoundValue,
 }
 
 impl GameSession {
@@ -75,7 +75,7 @@ impl GameSession {
     // ── Construction ──
 
     #[new]
-    fn new(seed: u64, set_id: u32) -> PyResult<Self> {
+    fn new(seed: u64, set_id: SetIdValue) -> PyResult<Self> {
         let card_pool = oab_assets::cards::build_pool();
         let all_sets = oab_assets::sets::get_all();
         let card_set = all_sets
@@ -201,7 +201,7 @@ impl GameSession {
         let outcome = self.run_battle(&opponent);
 
         let won_game = self.state.wins >= self.state.config.wins_to_victory;
-        let lost_game = self.state.lives <= 0;
+        let lost_game = self.state.lives == 0;
         let capped_out =
             !won_game && !lost_game && self.max_rounds_per_game > 0 && completed_round >= self.max_rounds_per_game;
         let game_over = won_game || lost_game || capped_out;
@@ -237,7 +237,7 @@ impl GameSession {
                 "defeat"
             })
         } else {
-            self.state.shop.round += 1;
+            self.state.shop.round = self.state.shop.round.saturating_add(1);
             self.state.shop.mana_limit = self
                 .state
                 .config
@@ -293,7 +293,7 @@ impl GameSession {
     }
 
     /// Get (round, lives, wins) tuple.
-    fn get_info(&self) -> (i32, i32, i32) {
+    fn get_info(&self) -> (RoundValue, RoundValue, RoundValue) {
         (self.state.shop.round, self.state.lives, self.state.wins)
     }
 
@@ -335,7 +335,7 @@ impl GameSession {
         self.action_count
     }
 
-    fn set_max_rounds(&mut self, max_rounds: i32) {
+    fn set_max_rounds(&mut self, max_rounds: RoundValue) {
         self.max_rounds_per_game = max_rounds;
     }
 
@@ -380,8 +380,8 @@ impl GameSession {
                     continue;
                 }
                 if let Some(card_id) = self.find_card_id_from_json(entry) {
-                    let perm_attack = entry["perm_attack"].as_i64().unwrap_or(0) as i32;
-                    let perm_health = entry["perm_health"].as_i64().unwrap_or(0) as i32;
+                    let perm_attack = entry["perm_attack"].as_i64().unwrap_or(0) as StatValue;
+                    let perm_health = entry["perm_health"].as_i64().unwrap_or(0) as StatValue;
                     self.state.shop.board[i] = Some(BoardUnit {
                         card_id,
                         perm_attack,
@@ -392,20 +392,20 @@ impl GameSession {
         }
 
         // Sync scalars
-        if let Some(mana) = state["mana"].as_i64() {
-            self.state.shop.shop_mana = mana as i32;
+        if let Some(mana) = state["mana"].as_u64() {
+            self.state.shop.shop_mana = mana as ManaValue;
         }
-        if let Some(mana_limit) = state["mana_limit"].as_i64() {
-            self.state.shop.mana_limit = mana_limit as i32;
+        if let Some(mana_limit) = state["mana_limit"].as_u64() {
+            self.state.shop.mana_limit = mana_limit as ManaValue;
         }
-        if let Some(round) = state["round"].as_i64() {
-            self.state.shop.round = round as i32;
+        if let Some(round) = state["round"].as_u64() {
+            self.state.shop.round = round as RoundValue;
         }
-        if let Some(lives) = state["lives"].as_i64() {
-            self.state.lives = lives as i32;
+        if let Some(lives) = state["lives"].as_u64() {
+            self.state.lives = lives as RoundValue;
         }
-        if let Some(wins) = state["wins"].as_i64() {
-            self.state.wins = wins as i32;
+        if let Some(wins) = state["wins"].as_u64() {
+            self.state.wins = wins as RoundValue;
         }
         if let Some(seed) = state["game_seed"].as_u64() {
             self.state.shop.game_seed = seed;
@@ -417,7 +417,7 @@ impl GameSession {
             for entry in bag {
                 let count = entry["count"].as_u64().unwrap_or(0) as usize;
                 if let Some(card_id_val) = entry["card_id"].as_u64() {
-                    let cid = CardId(card_id_val as u32);
+                    let cid = CardId(card_id_val as u16);
                     for _ in 0..count {
                         self.state.bag.push(cid);
                     }
@@ -431,7 +431,7 @@ impl GameSession {
 
     // ── Legacy JSON API (for play.py and debugging) ──
 
-    fn reset(&mut self, seed: u64, set_id: Option<u32>) -> PyResult<String> {
+    fn reset(&mut self, seed: u64, set_id: Option<SetIdValue>) -> PyResult<String> {
         let max_rounds_per_game = self.max_rounds_per_game;
         if let Some(set_id) = set_id {
             *self = GameSession::new(seed, set_id)?;
@@ -514,7 +514,7 @@ impl GameSession {
         let outcome = self.run_battle(&opponent);
 
         let won_game = self.state.wins >= self.state.config.wins_to_victory;
-        let lost_game = self.state.lives <= 0;
+        let lost_game = self.state.lives == 0;
         let capped_out =
             !won_game && !lost_game && self.max_rounds_per_game > 0 && completed_round >= self.max_rounds_per_game;
         let game_over = won_game || lost_game || capped_out;
@@ -529,7 +529,7 @@ impl GameSession {
                 "defeat"
             })
         } else {
-            self.state.shop.round += 1;
+            self.state.shop.round = self.state.shop.round.saturating_add(1);
             self.state.shop.mana_limit = self
                 .state
                 .config
@@ -582,12 +582,12 @@ impl GameSession {
 
 #[derive(serde::Deserialize)]
 struct OpponentUnit {
-    card_id: u32,
-    slot: u32,
+    card_id: u16,
+    slot: IndexValue,
     #[serde(default)]
-    perm_attack: i32,
+    perm_attack: StatValue,
     #[serde(default)]
-    perm_health: i32,
+    perm_health: StatValue,
 }
 
 struct BattleOutcome {
@@ -693,7 +693,7 @@ impl GameSession {
             board_size,
         );
 
-        self.state.shop.shop_mana = player_shop_mana_delta_from_events(&events).max(0);
+        self.state.shop.shop_mana = player_shop_mana_delta_from_events(&events).max(0) as ManaValue;
         let permanent_deltas = player_permanent_stat_deltas_from_events(&events);
         apply_permanent_deltas(&mut self.state.shop, &player_slots, &permanent_deltas);
 
@@ -710,8 +710,8 @@ impl GameSession {
             .unwrap_or(BattleResult::Draw);
 
         match &result {
-            BattleResult::Victory => self.state.wins += 1,
-            BattleResult::Defeat => self.state.lives -= 1,
+            BattleResult::Victory => self.state.wins = self.state.wins.saturating_add(1),
+            BattleResult::Defeat => self.state.lives = self.state.lives.saturating_sub(1),
             BattleResult::Draw => {}
         }
 
@@ -743,14 +743,14 @@ impl GameSession {
     fn find_card_id_from_json(&self, entry: &serde_json::Value) -> Option<CardId> {
         // Try direct card_id field first
         if let Some(id) = entry["card_id"].as_u64() {
-            let cid = CardId(id as u32);
+            let cid = CardId(id as u16);
             if self.state.shop.card_pool.contains_key(&cid) {
                 return Some(cid);
             }
         }
         // Try "id" field (from CardView serialization)
         if let Some(id) = entry["id"].as_u64() {
-            let cid = CardId(id as u32);
+            let cid = CardId(id as u16);
             if self.state.shop.card_pool.contains_key(&cid) {
                 return Some(cid);
             }
@@ -770,7 +770,7 @@ impl GameSession {
 fn apply_permanent_deltas(
     state: &mut oab_battle::state::ShopState,
     player_slots: &[usize],
-    deltas: &BTreeMap<UnitId, (i32, i32)>,
+    deltas: &BTreeMap<UnitId, (StatValue, StatValue)>,
 ) {
     for (unit_id, (attack_delta, health_delta)) in deltas {
         let unit_index = unit_id.raw() as usize;

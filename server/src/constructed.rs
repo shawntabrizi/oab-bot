@@ -6,12 +6,12 @@
 use crate::local::GameSession;
 use crate::types::{GameStateResponse, StepResponse};
 
-use oab_battle::types::CommitTurnAction;
+use oab_battle::types::{CommitTurnAction, SetIdValue};
 
 /// A constructed match between two players.
 pub struct ConstructedMatch {
     pub match_id: String,
-    pub set_id: u32,
+    pub set_id: SetIdValue,
     players: [Option<ConstructedPlayer>; 2],
     shops_submitted: [bool; 2],
 }
@@ -23,7 +23,7 @@ struct ConstructedPlayer {
 
 impl ConstructedMatch {
     /// Create a new match waiting for players.
-    pub fn new(match_id: String, set_id: u32) -> Self {
+    pub fn new(match_id: String, set_id: SetIdValue) -> Self {
         Self {
             match_id,
             set_id,
@@ -36,7 +36,7 @@ impl ConstructedMatch {
     pub fn join(
         &mut self,
         agent_id: String,
-        deck: Vec<u32>,
+        deck: Vec<u16>,
         seed: u64,
     ) -> Result<GameStateResponse, String> {
         // Find an open slot
@@ -159,11 +159,11 @@ impl ConstructedMatch {
 mod tests {
     use super::*;
 
-    fn sample_deck(set_id: u32) -> Vec<u32> {
+    fn sample_deck(set_id: u16) -> Vec<u16> {
         let sets = oab_assets::sets::get_all();
         let set = &sets[set_id as usize];
         // Build a valid 50-card deck using draftable cards
-        let draftable: Vec<u32> = set
+        let draftable: Vec<u16> = set
             .cards
             .iter()
             .filter(|e| e.rarity > 0)

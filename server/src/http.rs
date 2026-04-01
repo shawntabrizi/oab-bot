@@ -18,6 +18,8 @@ use std::sync::Mutex;
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use oab_battle::types::SetIdValue;
+
 use crate::constructed::ConstructedMatch;
 use crate::local::GameSession;
 use crate::types::*;
@@ -26,11 +28,11 @@ use crate::types::*;
 pub struct LocalBackend {
     sessions: HashMap<String, GameSession>,
     constructed_matches: HashMap<String, ConstructedMatch>,
-    default_set_id: u32,
+    default_set_id: SetIdValue,
 }
 
 impl LocalBackend {
-    pub fn new(default_set_id: u32) -> Self {
+    pub fn new(default_set_id: SetIdValue) -> Self {
         Self {
             sessions: HashMap::new(),
             constructed_matches: HashMap::new(),

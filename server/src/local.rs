@@ -28,7 +28,7 @@ pub struct GameSession {
 
 impl GameSession {
     /// Start a new sealed game with the given seed and card set.
-    pub fn new(seed: u64, set_id: u32) -> Result<Self, String> {
+    pub fn new(seed: u64, set_id: SetIdValue) -> Result<Self, String> {
         let config = sealed::default_config();
         let card_pool = oab_assets::cards::build_pool();
         let all_sets = oab_assets::sets::get_all();
@@ -51,7 +51,7 @@ impl GameSession {
     }
 
     /// Start a new constructed game with a user-provided deck.
-    pub fn new_constructed(seed: u64, set_id: u32, deck: Vec<u32>) -> Result<Self, String> {
+    pub fn new_constructed(seed: u64, set_id: SetIdValue, deck: Vec<u16>) -> Result<Self, String> {
         let config = constructed::default_config();
         let card_pool = oab_assets::cards::build_pool();
         let all_sets = oab_assets::sets::get_all();
@@ -86,7 +86,7 @@ impl GameSession {
                 let u = unit.as_ref()?;
                 Some(OpponentUnit {
                     card_id: u.card_id.0,
-                    slot: slot as u32,
+                    slot: slot as IndexValue,
                     perm_attack: u.perm_attack,
                     perm_health: u.perm_health,
                 })
@@ -142,7 +142,7 @@ impl GameSession {
 
         // Check game over
         let game_over =
-            self.state.wins >= self.state.config.wins_to_victory || self.state.lives <= 0;
+            self.state.wins >= self.state.config.wins_to_victory || self.state.lives == 0;
         let game_result = if game_over {
             self.state.phase = GamePhase::Completed;
             Some(
@@ -155,7 +155,7 @@ impl GameSession {
             )
         } else {
             // Advance to next round
-            self.state.round += 1;
+            self.state.round = self.state.round.saturating_add(1);
             self.state.mana_limit = self.state.config.mana_limit_for_round(self.state.round);
             if self.state.config.full_mana_each_round {
                 self.state.shop_mana = self.state.mana_limit;
@@ -216,7 +216,7 @@ impl GameSession {
         let mut rng = XorShiftRng::seed_from_u64(battle_seed);
         let events = resolve_battle(player_units, enemy_units, &mut rng, &self.state.card_pool, self.state.config.board_size as usize);
 
-        self.state.shop_mana = player_shop_mana_delta_from_events(&events).max(0);
+        self.state.shop_mana = player_shop_mana_delta_from_events(&events).max(0) as ManaValue;
         let permanent_deltas = player_permanent_stat_deltas_from_events(&events);
         apply_permanent_deltas(&mut self.state, &player_slots, &permanent_deltas);
 
@@ -233,8 +233,8 @@ impl GameSession {
             .unwrap_or(BattleResult::Draw);
 
         match &result {
-            BattleResult::Victory => self.state.wins += 1,
-            BattleResult::Defeat => self.state.lives -= 1,
+            BattleResult::Victory => self.state.wins = self.state.wins.saturating_add(1),
+            BattleResult::Defeat => self.state.lives = self.state.lives.saturating_sub(1),
             BattleResult::Draw => {}
         }
 
@@ -297,7 +297,7 @@ impl GameSession {
 fn apply_permanent_deltas(
     state: &mut GameState,
     player_slots: &[usize],
-    deltas: &BTreeMap<UnitId, (i32, i32)>,
+    deltas: &BTreeMap<UnitId, (StatValue, StatValue)>,
 ) {
     for (unit_id, (attack_delta, health_delta)) in deltas {
         let unit_index = unit_id.raw() as usize;

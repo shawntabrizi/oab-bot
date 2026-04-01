@@ -36,15 +36,15 @@ mod inner {
         keypair: Keypair,
         account_id: subxt::utils::AccountId32,
         card_pool: BTreeMap<CardId, UnitCard>,
-        sets: Vec<(u32, Vec<CardSetEntry>)>, // (set_id, entries) for all sets on chain
+        sets: Vec<(SetIdValue, Vec<CardSetEntry>)>, // (set_id, entries) for all sets on chain
         state: Option<GameState>,
-        set_id: u32,
+        set_id: SetIdValue,
         rt: Runtime,
     }
 
     impl ChainGameSession {
         /// Connect to a chain and create a new session.
-        pub fn new(url: &str, suri: &str, set_id: u32) -> Result<Self, String> {
+        pub fn new(url: &str, suri: &str, set_id: SetIdValue) -> Result<Self, String> {
             let rt = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
             let api = rt
@@ -129,7 +129,7 @@ mod inner {
         pub fn reset(
             &mut self,
             _seed: u64,
-            set_id: Option<u32>,
+            set_id: Option<SetIdValue>,
         ) -> Result<GameStateResponse, String> {
             let set_id = set_id.unwrap_or(self.set_id);
 
@@ -381,7 +381,7 @@ mod inner {
             self.sets
                 .iter()
                 .map(|(id, entries)| crate::types::SetInfo {
-                    id: *id,
+                    id: *id as u32,
                     name: format!("Set #{}", id),
                     card_count: entries.len(),
                     cards: entries
@@ -422,7 +422,7 @@ mod inner {
         api: &OnlineClient<SubstrateConfig>,
         keypair: &Keypair,
         action_value: Value,
-    ) -> Result<Option<(u64, Vec<(u32, i32, i32)>)>, String> {
+    ) -> Result<Option<(u64, Vec<(u16, StatValue, StatValue)>)>, String> {
         let tx = subxt::dynamic::tx("OabArena", "submit_turn", vec![("action", action_value)]);
 
         let mut progress = api
@@ -657,7 +657,7 @@ mod inner {
 
     async fn load_all_sets_from_chain(
         api: &OnlineClient<SubstrateConfig>,
-    ) -> Result<Vec<(u32, Vec<CardSetEntry>)>, String> {
+    ) -> Result<Vec<(SetIdValue, Vec<CardSetEntry>)>, String> {
         let mut sets = Vec::new();
         let storage = api
             .storage()
@@ -688,12 +688,12 @@ mod inner {
     /// Returns (battle_seed, Vec<(card_id, perm_attack, perm_health)>)
     fn decode_battle_reported_event(
         bytes: &[u8],
-    ) -> Result<(u64, Vec<(u32, i32, i32)>), parity_scale_codec::Error> {
+    ) -> Result<(u64, Vec<(u16, StatValue, StatValue)>), parity_scale_codec::Error> {
         let mut input = bytes;
         // owner: AccountId32 (32 bytes)
         let _owner = <[u8; 32]>::decode(&mut input)?;
-        // round: i32
-        let _round = i32::decode(&mut input)?;
+        // round: RoundValue (u8)
+        let _round = RoundValue::decode(&mut input)?;
         // result: BattleResult (enum, 1 byte index)
         let _result = u8::decode(&mut input)?;
         // new_seed: u64
@@ -702,13 +702,13 @@ mod inner {
         let battle_seed = u64::decode(&mut input)?;
         // opponent_board: BoundedGhostBoard = { units: BoundedVec<GhostBoardUnit> }
         // BoundedVec encodes as Vec: length prefix + items
-        // GhostBoardUnit: { card_id: CardId(u32), perm_attack: i32, perm_health: i32 }
+        // GhostBoardUnit: { card_id: CardId(u16), perm_attack: StatValue(i16), perm_health: StatValue(i16) }
         let unit_count = parity_scale_codec::Compact::<u32>::decode(&mut input)?.0 as usize;
         let mut units = Vec::with_capacity(unit_count);
         for _ in 0..unit_count {
-            let card_id = u32::decode(&mut input)?;
-            let perm_attack = i32::decode(&mut input)?;
-            let perm_health = i32::decode(&mut input)?;
+            let card_id = u16::decode(&mut input)?;
+            let perm_attack = StatValue::decode(&mut input)?;
+            let perm_health = StatValue::decode(&mut input)?;
             units.push((card_id, perm_attack, perm_health));
         }
 
@@ -736,15 +736,10 @@ mod inner {
         Ok(String::from_utf8_lossy(&name_bytes).to_string())
     }
 
-    fn extract_card_id_from_key(key_bytes: &[u8]) -> u32 {
-        if key_bytes.len() >= 4 {
-            let offset = key_bytes.len() - 4;
-            u32::from_le_bytes([
-                key_bytes[offset],
-                key_bytes[offset + 1],
-                key_bytes[offset + 2],
-                key_bytes[offset + 3],
-            ])
+    fn extract_card_id_from_key(key_bytes: &[u8]) -> u16 {
+        if key_bytes.len() >= 2 {
+            let offset = key_bytes.len() - 2;
+            u16::from_le_bytes([key_bytes[offset], key_bytes[offset + 1]])
         } else {
             0
         }

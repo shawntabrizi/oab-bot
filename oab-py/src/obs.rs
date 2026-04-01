@@ -150,18 +150,18 @@ impl ObsConstants {
                 None => continue,
             };
 
-            max_card_id = max_card_id.max(card_id.0);
-            max_attack = max_attack.max(card.stats.attack);
-            max_health = max_health.max(card.stats.health);
-            max_cost = max_cost.max(card.economy.play_cost);
-            max_burn = max_burn.max(card.economy.burn_value);
+            max_card_id = max_card_id.max(card_id.0 as u32);
+            max_attack = max_attack.max(card.stats.attack as i32);
+            max_health = max_health.max(card.stats.health as i32);
+            max_cost = max_cost.max(card.economy.play_cost as i32);
+            max_burn = max_burn.max(card.economy.burn_value as i32);
             max_battle_abilities = max_battle_abilities.max(card.battle_abilities.len());
             max_shop_abilities = max_shop_abilities.max(card.shop_abilities.len());
 
             for ability in &card.battle_abilities {
                 max_conditions = max_conditions.max(ability.conditions.len());
                 if let Some(n) = ability.max_triggers {
-                    max_triggers_limit = max_triggers_limit.max(n);
+                    max_triggers_limit = max_triggers_limit.max(n as u32);
                 }
                 scan_battle_effect_maxes(
                     &ability.effect,
@@ -174,15 +174,15 @@ impl ObsConstants {
                 // Also scan spawned card stats
                 if let AbilityEffect::SpawnUnit { card_id: spawn_id, .. } = &ability.effect {
                     if let Some(spawned) = card_pool.get(spawn_id) {
-                        max_attack = max_attack.max(spawned.stats.attack);
-                        max_health = max_health.max(spawned.stats.health);
+                        max_attack = max_attack.max(spawned.stats.attack as i32);
+                        max_health = max_health.max(spawned.stats.health as i32);
                     }
                 }
             }
             for ability in &card.shop_abilities {
                 max_conditions = max_conditions.max(ability.conditions.len());
                 if let Some(n) = ability.max_triggers {
-                    max_triggers_limit = max_triggers_limit.max(n);
+                    max_triggers_limit = max_triggers_limit.max(n as u32);
                 }
                 scan_shop_effect_maxes(&ability.effect, &mut max_effect_value);
                 for cond in &ability.conditions {
@@ -190,8 +190,8 @@ impl ObsConstants {
                 }
                 if let ShopEffect::SpawnUnit { card_id: spawn_id, .. } = &ability.effect {
                     if let Some(spawned) = card_pool.get(spawn_id) {
-                        max_attack = max_attack.max(spawned.stats.attack);
-                        max_health = max_health.max(spawned.stats.health);
+                        max_attack = max_attack.max(spawned.stats.attack as i32);
+                        max_health = max_health.max(spawned.stats.health as i32);
                     }
                 }
             }
@@ -281,19 +281,19 @@ impl ObsConstants {
 fn scan_battle_effect_maxes(effect: &AbilityEffect, max_val: &mut i32, max_count: &mut u32) {
     match effect {
         AbilityEffect::Damage { amount, target } => {
-            *max_val = (*max_val).max(amount.abs());
+            *max_val = (*max_val).max((*amount as i32).abs());
             scan_battle_target_count(target, max_count);
         }
         AbilityEffect::ModifyStats { health, attack, target } => {
-            *max_val = (*max_val).max(attack.abs()).max(health.abs());
+            *max_val = (*max_val).max((*attack as i32).abs()).max((*health as i32).abs());
             scan_battle_target_count(target, max_count);
         }
         AbilityEffect::ModifyStatsPermanent { health, attack, target } => {
-            *max_val = (*max_val).max(attack.abs()).max(health.abs());
+            *max_val = (*max_val).max((*attack as i32).abs()).max((*health as i32).abs());
             scan_battle_target_count(target, max_count);
         }
         AbilityEffect::GainMana { amount } => {
-            *max_val = (*max_val).max(amount.abs());
+            *max_val = (*max_val).max((*amount as i32).abs());
         }
         AbilityEffect::SpawnUnit { .. } | AbilityEffect::Destroy { .. } => {}
     }
@@ -302,7 +302,7 @@ fn scan_battle_effect_maxes(effect: &AbilityEffect, max_val: &mut i32, max_count
 fn scan_battle_target_count(target: &AbilityTarget, max_count: &mut u32) {
     match target {
         AbilityTarget::Random { count, .. } | AbilityTarget::Standard { count, .. } => {
-            *max_count = (*max_count).max(*count);
+            *max_count = (*max_count).max(*count as u32);
         }
         _ => {}
     }
@@ -311,10 +311,10 @@ fn scan_battle_target_count(target: &AbilityTarget, max_count: &mut u32) {
 fn scan_shop_effect_maxes(effect: &ShopEffect, max_val: &mut i32) {
     match effect {
         ShopEffect::ModifyStatsPermanent { health, attack, .. } => {
-            *max_val = (*max_val).max(attack.abs()).max(health.abs());
+            *max_val = (*max_val).max((*attack as i32).abs()).max((*health as i32).abs());
         }
         ShopEffect::GainMana { amount } => {
-            *max_val = (*max_val).max(amount.abs());
+            *max_val = (*max_val).max((*amount as i32).abs());
         }
         ShopEffect::SpawnUnit { .. } | ShopEffect::Destroy { .. } => {}
     }
@@ -344,19 +344,19 @@ fn scan_shop_condition_maxes(cond: &ShopCondition, max_val: &mut i32) {
 
 fn scan_matcher_value(m: &Matcher, max_val: &mut i32) {
     match m {
-        Matcher::StatValueCompare { value, .. } => *max_val = (*max_val).max(value.abs()),
-        Matcher::TargetStatValueCompare { value, .. } => *max_val = (*max_val).max(value.abs()),
+        Matcher::StatValueCompare { value, .. } => *max_val = (*max_val).max((*value as i32).abs()),
+        Matcher::TargetStatValueCompare { value, .. } => *max_val = (*max_val).max((*value as i32).abs()),
         Matcher::UnitCount { value, .. } => *max_val = (*max_val).max(*value as i32),
-        Matcher::IsPosition { index, .. } => *max_val = (*max_val).max(index.abs()),
+        Matcher::IsPosition { index, .. } => *max_val = (*max_val).max((*index as i32).abs()),
         Matcher::StatStatCompare { .. } => {}
     }
 }
 
 fn scan_shop_matcher_value(m: &ShopMatcher, max_val: &mut i32) {
     match m {
-        ShopMatcher::StatValueCompare { value, .. } => *max_val = (*max_val).max(value.abs()),
+        ShopMatcher::StatValueCompare { value, .. } => *max_val = (*max_val).max((*value as i32).abs()),
         ShopMatcher::UnitCount { value, .. } => *max_val = (*max_val).max(*value as i32),
-        ShopMatcher::IsPosition { index, .. } => *max_val = (*max_val).max(index.abs()),
+        ShopMatcher::IsPosition { index, .. } => *max_val = (*max_val).max((*index as i32).abs()),
     }
 }
 
@@ -758,7 +758,7 @@ fn encode_card_abilities(
 pub fn encode_observation(
     shadow_hand: &[Option<CardId>],
     shadow_board: &[Option<BoardUnit>],
-    shadow_mana: i32,
+    shadow_mana: ManaValue,
     state: &oab_game::GameState,
     c: &ObsConstants,
 ) -> Vec<f32> {

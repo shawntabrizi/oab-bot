@@ -19,25 +19,25 @@ pub fn action_to_turn_action(index: u32) -> Option<TurnAction> {
     match i {
         0 => None, // EndTurn
         1..=5 => Some(TurnAction::BurnFromHand {
-            hand_index: (i - 1) as u32,
+            hand_index: (i - 1) as IndexValue,
         }),
         6..=30 => {
             let offset = i - 6;
             Some(TurnAction::PlayFromHand {
-                hand_index: (offset / BOARD_SIZE) as u32,
-                board_slot: (offset % BOARD_SIZE) as u32,
+                hand_index: (offset / BOARD_SIZE) as IndexValue,
+                board_slot: (offset % BOARD_SIZE) as IndexValue,
             })
         }
         31..=35 => Some(TurnAction::BurnFromBoard {
-            board_slot: (i - 31) as u32,
+            board_slot: (i - 31) as IndexValue,
         }),
         36..=45 => {
             // Unordered pairs: (0,1),(0,2),(0,3),(0,4),(1,2),(1,3),(1,4),(2,3),(2,4),(3,4)
             let pair_index = i - 36;
             let (a, b) = SWAP_PAIRS[pair_index];
             Some(TurnAction::SwapBoard {
-                slot_a: a as u32,
-                slot_b: b as u32,
+                slot_a: a as IndexValue,
+                slot_b: b as IndexValue,
             })
         }
         46..=65 => {
@@ -45,8 +45,8 @@ pub fn action_to_turn_action(index: u32) -> Option<TurnAction> {
             let pair_index = i - 46;
             let (f, t) = MOVE_PAIRS[pair_index];
             Some(TurnAction::MoveBoard {
-                from_slot: f as u32,
-                to_slot: t as u32,
+                from_slot: f as IndexValue,
+                to_slot: t as IndexValue,
             })
         }
         _ => None,
@@ -94,7 +94,7 @@ const MOVE_PAIRS: [(usize, usize); 20] = [
 pub fn compute_action_mask(
     shadow_hand: &[Option<CardId>],
     shadow_board: &[Option<BoardUnit>],
-    shadow_mana: i32,
+    shadow_mana: ManaValue,
     pending_count: usize,
     max_actions_per_turn: usize,
     card_pool: &std::collections::BTreeMap<CardId, UnitCard>,
@@ -176,7 +176,7 @@ mod tests {
     fn test_burn_from_hand() {
         for i in 0..5u32 {
             let action = action_to_turn_action(1 + i).unwrap();
-            assert!(matches!(action, TurnAction::BurnFromHand { hand_index } if hand_index == i));
+            assert!(matches!(action, TurnAction::BurnFromHand { hand_index } if hand_index == i as IndexValue));
         }
     }
 

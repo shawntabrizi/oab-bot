@@ -32,7 +32,7 @@ struct Args {
 
     /// Default card set ID
     #[arg(long, default_value_t = 0)]
-    set: u32,
+    set: u16,
 
     /// Chain RPC endpoint (enables on-chain mode)
     #[arg(long)]
