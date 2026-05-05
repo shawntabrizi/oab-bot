@@ -81,9 +81,7 @@ impl ConstructedMatch {
             return Err("Shop already submitted this round".into());
         }
 
-        let player = self.players[idx]
-            .as_mut()
-            .ok_or("Player not found")?;
+        let player = self.players[idx].as_mut().ok_or("Player not found")?;
         let state = player.session.shop(action)?;
         self.shops_submitted[idx] = true;
         Ok(state)
@@ -136,9 +134,7 @@ impl ConstructedMatch {
     /// Get the current game state for a player.
     pub fn get_state(&self, agent_id: &str) -> Result<GameStateResponse, String> {
         let idx = self.player_index(agent_id)?;
-        let player = self.players[idx]
-            .as_ref()
-            .ok_or("Player not found")?;
+        let player = self.players[idx].as_ref().ok_or("Player not found")?;
         Ok(player.session.get_state())
     }
 
@@ -151,7 +147,10 @@ impl ConstructedMatch {
                 }
             }
         }
-        Err(format!("Agent '{}' not found in match '{}'", agent_id, self.match_id))
+        Err(format!(
+            "Agent '{}' not found in match '{}'",
+            agent_id, self.match_id
+        ))
     }
 }
 

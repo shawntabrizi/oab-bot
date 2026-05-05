@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Run the trained OAB bot on-chain.
+# Run the trained OAB bot against a remote OAB contract deployment.
 #
 # Usage:
-#   ./run.sh                                          # defaults: //Alice, 1 game
-#   ./run.sh --games 5                                # play 5 games
-#   ./run.sh --key //Bob --games 10                   # play as Bob
-#   ./run.sh --rpc wss://other-node.example.com       # custom RPC
-#   ./run.sh --model models/oab_agent_5m --games 3    # different model
-#   ./run.sh --set 1                                  # use card set 1
-#   ./run.sh --quiet                                  # suppress per-round output
+#   ./run.sh --rpc <URL> --contract 0xabc... --from 0xdef... --games 5
+#
+# Notes:
+#   The bot uses node-managed accounts (eth_sendTransaction signs on the node
+#   side). For nodes without exposed dev accounts, run a local proxy that
+#   provides eth_accounts, or extend the server to take a private key.
 
 set -euo pipefail
 
@@ -17,37 +16,39 @@ SERVER_DIR="$SCRIPT_DIR/server"
 SERVER_BIN="$SERVER_DIR/target/release/oab-server"
 
 # ── Defaults ──
-RPC_URL="wss://oab-rpc.shawntabrizi.com"
-KEY="//Alice"
+RPC_URL="http://localhost:8545"
+CONTRACT=""
+FROM=""
 MODEL="models/oab_agent"
 GAMES=1
 SET_ID=0
 PORT=3030
 QUIET=""
-EXTRA_ARGS=""
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --rpc)      RPC_URL="$2"; shift 2 ;;
-        --key)      KEY="$2"; shift 2 ;;
-        --model)    MODEL="$2"; shift 2 ;;
-        --games)    GAMES="$2"; shift 2 ;;
-        --set)      SET_ID="$2"; shift 2 ;;
-        --port)     PORT="$2"; shift 2 ;;
-        --quiet)    QUIET="--quiet"; shift ;;
+        --rpc)       RPC_URL="$2"; shift 2 ;;
+        --contract)  CONTRACT="$2"; shift 2 ;;
+        --from)      FROM="$2"; shift 2 ;;
+        --model)     MODEL="$2"; shift 2 ;;
+        --games)     GAMES="$2"; shift 2 ;;
+        --set)       SET_ID="$2"; shift 2 ;;
+        --port)      PORT="$2"; shift 2 ;;
+        --quiet)     QUIET="--quiet"; shift ;;
         --help|-h)
             echo "Usage: ./run.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --rpc <URL>      Chain RPC endpoint (default: wss://oab-rpc.shawntabrizi.com)"
-            echo "  --key <SURI>     Signing key (default: //Alice)"
-            echo "  --model <PATH>   Model path (default: models/oab_agent)"
-            echo "  --games <N>      Number of games (default: 1)"
-            echo "  --set <N>        Card set ID (default: 0)"
-            echo "  --port <N>       Local server port (default: 3030)"
-            echo "  --quiet          Suppress per-round output"
-            echo "  --help           Show this help"
+            echo "  --rpc <URL>       Eth JSON-RPC endpoint (default: http://localhost:8545)"
+            echo "  --contract <ADDR> Contract address (default: read from deps/open-auto-battler/contract/deployment.json)"
+            echo "  --from <ADDR>     Caller address (default: first eth_accounts dev account)"
+            echo "  --model <PATH>    Model path (default: models/oab_agent)"
+            echo "  --games <N>       Number of games (default: 1)"
+            echo "  --set <N>         Card set ID (default: 0)"
+            echo "  --port <N>        Local server port (default: 3030)"
+            echo "  --quiet           Suppress per-round output"
+            echo "  --help            Show this help"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -70,15 +71,14 @@ if [[ ! -f "$SERVER_BIN" ]]; then
     (cd "$SERVER_DIR" && cargo build --release)
 fi
 
-# ── Fund account ──
-echo "Funding account ($KEY)..."
-"$SERVER_BIN" --url "$RPC_URL" --key "$KEY" --fund "$KEY" 2>&1 | grep -v "^$"
-
 # ── Start server ──
 SERVER_LOG="$SCRIPT_DIR/.server.log"
 echo ""
-echo "Starting server (chain mode, port $PORT)..."
-"$SERVER_BIN" --url "$RPC_URL" --key "$KEY" --port "$PORT" --set "$SET_ID" >"$SERVER_LOG" 2>&1 &
+echo "Starting server (contract mode, port $PORT)..."
+SERVER_ARGS=(--url "$RPC_URL" --port "$PORT" --set "$SET_ID")
+if [[ -n "$CONTRACT" ]]; then SERVER_ARGS+=(--contract "$CONTRACT"); fi
+if [[ -n "$FROM" ]];     then SERVER_ARGS+=(--from "$FROM"); fi
+"$SERVER_BIN" "${SERVER_ARGS[@]}" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be ready

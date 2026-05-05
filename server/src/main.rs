@@ -17,7 +17,7 @@ use http::{Backend, LocalBackend};
     about = "HTTP game server for AI agents to play Open Auto Battler.\n\n\
              Modes:\n  \
              Local (default)  Caller provides opponent boards each round.\n  \
-             On-chain         Provide --url and --key to play on a live blockchain.\n\n\
+             On-chain         Provide --url to play against the OAB PolkaVM contract.\n\n\
              Endpoints:\n  \
              POST /reset   Start new game\n  \
              POST /submit  Submit actions\n  \
@@ -34,63 +34,34 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     set: u16,
 
-    /// Chain RPC endpoint (enables on-chain mode)
+    /// Ethereum JSON-RPC endpoint (enables on-chain mode, e.g. http://localhost:8545)
     #[arg(long)]
     url: Option<String>,
 
-    /// Secret key/SURI for signing (or set OAB_SECRET_SEED env var)
-    #[arg(long, env = "OAB_SECRET_SEED")]
-    key: Option<String>,
+    /// Deployed contract address (defaults to deps/open-auto-battler/contract/deployment.json)
+    #[arg(long)]
+    contract: Option<String>,
 
-    /// Fund accounts via sudo and exit (--key must be sudo key)
-    #[arg(long, num_args = 1..)]
-    fund: Vec<String>,
+    /// `from` address for transactions (defaults to first dev account from eth_accounts).
+    /// The node-managed dev account signs the transactions.
+    #[arg(long)]
+    from: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
 
-    // Fund mode: fund target accounts and exit
-    if !args.fund.is_empty() {
-        #[cfg(feature = "chain")]
-        {
-            let url = args.url.as_deref().unwrap_or_else(|| {
-                eprintln!("Error: --url required for --fund mode.");
-                process::exit(1);
-            });
-            let key = args.key.as_deref().unwrap_or_else(|| {
-                eprintln!("Error: --key required for --fund mode (must be sudo key).");
-                process::exit(1);
-            });
-            eprintln!("Funding {} accounts...", args.fund.len());
-            if let Err(e) = chain::fund_accounts(url, key, &args.fund) {
-                eprintln!("Error funding accounts: {}", e);
-                process::exit(1);
-            }
-            eprintln!("All accounts funded.");
-            process::exit(0);
-        }
-        #[cfg(not(feature = "chain"))]
-        {
-            eprintln!("Error: --fund requires the 'chain' feature.");
-            process::exit(1);
-        }
-    }
-
     let backend = if let Some(url) = &args.url {
         // On-chain mode
         #[cfg(feature = "chain")]
         {
-            let key = match &args.key {
-                Some(k) => k.clone(),
-                None => {
-                    eprintln!("Error: --key or OAB_SECRET_SEED required for on-chain mode.");
-                    process::exit(1);
-                }
-            };
-
             eprintln!("Starting on-chain mode...");
-            match chain::ChainGameSession::new(url, &key, args.set) {
+            match chain::ChainGameSession::new(
+                url,
+                args.contract.as_deref(),
+                args.from.as_deref(),
+                args.set,
+            ) {
                 Ok(session) => Backend::Chain(session),
                 Err(e) => {
                     eprintln!("Error: {}", e);

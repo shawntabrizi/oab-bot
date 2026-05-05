@@ -61,7 +61,12 @@ impl GameSession {
             return Err(format!("Card set {} not found", set_id));
         };
 
-        constructed::validate_deck(&deck, &card_set, constructed::MAX_COPIES_PER_CARD, config.bag_size as usize)?;
+        constructed::validate_deck(
+            &deck,
+            &card_set,
+            constructed::MAX_COPIES_PER_CARD,
+            config.bag_size as usize,
+        )?;
 
         let deck_ids: Vec<CardId> = deck.into_iter().map(CardId).collect();
         let mut state = GameState::new(seed, config.clone());
@@ -214,7 +219,13 @@ impl GameSession {
 
         let battle_seed = self.state.round as u64;
         let mut rng = XorShiftRng::seed_from_u64(battle_seed);
-        let events = resolve_battle(player_units, enemy_units, &mut rng, &self.state.card_pool, self.state.config.board_size as usize);
+        let events = resolve_battle(
+            player_units,
+            enemy_units,
+            &mut rng,
+            &self.state.card_pool,
+            self.state.config.board_size as usize,
+        );
 
         self.state.shop_mana = player_shop_mana_delta_from_events(&events).max(0) as ManaValue;
         let permanent_deltas = player_permanent_stat_deltas_from_events(&events);

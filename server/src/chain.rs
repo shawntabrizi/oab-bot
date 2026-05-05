@@ -1,181 +1,130 @@
-//! On-chain game backend.
+//! Contract game backend.
 //!
-//! Implements GameBackend by proxying to a Substrate blockchain.
-//! Cards are loaded from chain storage. Turns are verified locally
-//! then submitted as extrinsics.
+//! Talks to the OAB PolkaVM smart contract over Ethereum JSON-RPC. Uses
+//! `eth_sendTransaction` with a node-managed dev account for signing
+//! (mirrors what the local revive-dev-node provides). Cards and sets are
+//! baked in via `oab_assets` — we never read them from the chain.
 
 #[cfg(feature = "chain")]
 mod inner {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    use parity_scale_codec::{Decode, Encode};
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use tiny_keccak::{Hasher, Keccak};
 
     use oab_battle::battle::{resolve_battle, BattleResult, CombatUnit};
     use oab_battle::rng::XorShiftRng;
-    use oab_battle::state::*;
     use oab_battle::types::*;
     use oab_game::view::GameView;
-    use oab_game::{GamePhase, GameSession, GameState};
+    use oab_game::{sealed, GamePhase, GameState, LocalGameState};
 
-    use bounded_collections::ConstU32;
-    use parity_scale_codec::Decode;
-    use subxt::config::SubstrateConfig;
-    use subxt::dynamic::Value;
-    use subxt::OnlineClient;
-    use subxt_signer::sr25519::Keypair;
-    use tokio::runtime::Runtime;
+    use crate::types::{BattleReport, GameStateResponse, SetCardEntry, SetInfo, StepResponse};
 
-    use crate::types::{BattleReport, GameStateResponse, StepResponse};
+    /// keccak256("BattleReported(uint8,uint8,uint8,uint8,uint64,bytes)")
+    const BATTLE_REPORTED_TOPIC: &str =
+        "0x96fd1736ea4fbef32e328d7005021b05c7ee31f32694ddef23dd55af68e089bd";
 
-    type MaxBagSize = ConstU32<50>;
-    type MaxBoardSize = ConstU32<5>;
-    type MaxHandActions = ConstU32<10>;
+    // ── Public session ────────────────────────────────────────────────────
 
-    /// On-chain game session that submits turns to a Substrate blockchain.
+    /// Active arena session backed by the OAB PolkaVM contract.
     #[allow(dead_code)]
     pub struct ChainGameSession {
-        api: OnlineClient<SubstrateConfig>,
-        keypair: Keypair,
-        account_id: subxt::utils::AccountId32,
+        rpc_url: String,
+        contract_address: String,
+        from_address: String,
+        chain_id: u64,
         card_pool: BTreeMap<CardId, UnitCard>,
-        sets: Vec<(SetIdValue, Vec<CardSetEntry>)>, // (set_id, entries) for all sets on chain
         state: Option<GameState>,
         set_id: SetIdValue,
-        rt: Runtime,
     }
 
     impl ChainGameSession {
-        /// Connect to a chain and create a new session.
-        pub fn new(url: &str, suri: &str, set_id: SetIdValue) -> Result<Self, String> {
-            let rt = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
-
-            let api = rt
-                .block_on(OnlineClient::<SubstrateConfig>::from_url(url))
-                .map_err(|e| format!("Failed to connect to {}: {}", url, e))?;
-
-            let keypair = parse_suri(suri)?;
-            let account_id: subxt::utils::AccountId32 = keypair.public_key().into();
-
-            eprintln!("Connected to {}", url);
-            eprintln!("Account: {}", account_id);
-
-            // Load card pool from chain
-            let card_pool = rt
-                .block_on(load_card_pool_from_chain(&api))
-                .map_err(|e| format!("Failed to load cards: {}", e))?;
-            eprintln!("Loaded {} cards from chain.", card_pool.len());
-
-            // Load all sets from chain
-            let sets = rt
-                .block_on(load_all_sets_from_chain(&api))
-                .map_err(|e| format!("Failed to load sets: {}", e))?;
-            eprintln!("Loaded {} card sets from chain.", sets.len());
-
-            // Check for existing active game
-            let existing = rt
-                .block_on(load_active_game(&api, &account_id))
-                .map_err(|e| format!("Failed to check active game: {}", e))?;
-
-            let state = if let Some(session) = existing {
-                eprintln!(
-                    "Resuming game (round={}, wins={}, lives={}).",
-                    session.state.round, session.state.wins, session.state.lives
-                );
-                Some(GameState::reconstruct(
-                    card_pool.clone(),
-                    session.set_id,
-                    session.config,
-                    session.state,
-                ))
-            } else {
-                None
+        /// Connect to a node and bind to a deployed OAB contract.
+        ///
+        /// `contract_address` falls back to `deps/open-auto-battler/contract/deployment.json`.
+        /// `from_address` falls back to the first dev account on the node.
+        pub fn new(
+            rpc_url: &str,
+            contract_address: Option<&str>,
+            from_address: Option<&str>,
+            set_id: SetIdValue,
+        ) -> Result<Self, String> {
+            let contract_address = match contract_address {
+                Some(addr) => addr.to_string(),
+                None => find_deployment_address()?,
             };
 
-            Ok(Self {
-                api,
-                keypair,
-                account_id,
+            let chain_id = rpc::eth_chain_id(rpc_url)?;
+            let from_address = match from_address {
+                Some(addr) => addr.to_string(),
+                None => rpc::first_dev_account(rpc_url)?,
+            };
+
+            eprintln!("Connected to {} (chain id {})", rpc_url, chain_id);
+            eprintln!("Contract: {}", contract_address);
+            eprintln!("From:     {}", from_address);
+
+            let card_pool = oab_assets::cards::build_pool();
+
+            let mut session = Self {
+                rpc_url: rpc_url.to_string(),
+                contract_address,
+                from_address,
+                chain_id,
                 card_pool,
-                sets,
-                state,
+                state: None,
                 set_id,
-                rt,
-            })
-        }
+            };
 
-        fn sync_state_from_chain(&mut self) -> Result<(), String> {
-            let session = self
-                .rt
-                .block_on(load_active_game(&self.api, &self.account_id))
-                .map_err(|e| format!("Failed to fetch game state: {}", e))?;
-
-            match session {
-                Some(session) => {
-                    self.state = Some(GameState::reconstruct(
-                        self.card_pool.clone(),
-                        session.set_id,
-                        session.config,
-                        session.state,
-                    ));
-                    Ok(())
-                }
-                None => {
-                    self.state = None;
-                    Ok(())
-                }
+            session.sync_state_from_chain()?;
+            if session.state.is_some() {
+                let s = session.state.as_ref().unwrap();
+                eprintln!(
+                    "Resuming game (round={}, wins={}, lives={}).",
+                    s.round, s.wins, s.lives
+                );
             }
-        }
-    }
 
-    impl ChainGameSession {
+            Ok(session)
+        }
+
+        /// Reset the session: end/abandon any prior game and start a fresh one.
+        ///
+        /// `seed` is unused — the contract derives its own seed from caller +
+        /// `seed_nonce`. We still accept it so the public interface mirrors
+        /// the local backend's `reset(seed, set_id)`.
         pub fn reset(
             &mut self,
-            _seed: u64,
+            seed: u64,
             set_id: Option<SetIdValue>,
         ) -> Result<GameStateResponse, String> {
             let set_id = set_id.unwrap_or(self.set_id);
 
-            // Sync from chain to get the real state
             self.sync_state_from_chain()?;
 
-            // If there's an active game on-chain, clean it up
-            if let Some(ref state) = self.state {
+            if let Some(state) = &self.state {
                 if state.phase == GamePhase::Completed {
                     eprintln!("Ending completed game...");
-                    let _ = self.rt.block_on(submit_extrinsic(
-                        &self.api,
-                        &self.keypair,
-                        "OabArena",
-                        "end_game",
-                        vec![],
-                    ));
+                    let _ = self.send_call(&abi::encode_end_game());
                 } else {
                     eprintln!("Abandoning active game...");
-                    let _ = self.rt.block_on(submit_extrinsic(
-                        &self.api,
-                        &self.keypair,
-                        "OabArena",
-                        "abandon_game",
-                        vec![],
-                    ));
+                    let _ = self.send_call(&abi::encode_abandon_game());
                 }
                 self.sync_state_from_chain()?;
             }
 
-            // If game still exists after cleanup, something went wrong
             if self.state.is_some() {
                 return Err("Failed to clear active game on-chain. Try again.".into());
             }
 
-            // Start new game on-chain (seed is determined by chain randomness)
-            eprintln!("Starting new game with set {}...", set_id);
-            self.rt
-                .block_on(submit_extrinsic(
-                    &self.api,
-                    &self.keypair,
-                    "OabArena",
-                    "start_game",
-                    vec![("set_id", Value::u128(set_id as u128))],
-                ))
-                .map_err(|e| format!("Failed to start game: {}", e))?;
+            eprintln!("Starting new game (set_id={})...", set_id);
+            let nonce = seed; // Use the seed as the nonce; contract mixes with caller.
+            self.send_call(&abi::encode_start_game(set_id, nonce))?;
 
             self.set_id = set_id;
             self.sync_state_from_chain()?;
@@ -189,6 +138,8 @@ mod inner {
             }
         }
 
+        /// Submit a turn (shop actions + battle), parse the BattleReported
+        /// event, and replay the battle locally for the report.
         pub fn step(&mut self, action: &CommitTurnAction) -> Result<StepResponse, String> {
             let state = self
                 .state
@@ -202,12 +153,11 @@ mod inner {
                 return Err(format!("Wrong phase: {:?}", state.phase));
             }
 
-            // Local verification — also gives us the post-turn board for battle replay
+            // Local verification gives us the post-shop player board for replay.
             let mut verified_state = state.clone();
             oab_battle::commit::verify_and_apply_turn(&mut verified_state, action)
                 .map_err(|e| format!("{:?}", e))?;
 
-            // Snapshot player board after turn actions (before battle) for replay
             let player_units: Vec<CombatUnit> = verified_state
                 .board
                 .iter()
@@ -225,40 +175,40 @@ mod inner {
             let prev_wins = state.wins;
             let prev_lives = state.lives;
             let completed_round = state.round;
+            let board_size = state.config.board_size as usize;
 
-            // Submit on-chain and get BattleReported event data
             eprintln!("Submitting turn (round {})...", completed_round);
-            let action_value = commit_turn_action_to_value(action);
-            let battle_event = self
-                .rt
-                .block_on(submit_turn_and_get_battle_event(
-                    &self.api,
-                    &self.keypair,
-                    action_value,
-                ))
-                .map_err(|e| format!("Failed to submit turn: {}", e))?;
+            let action_bytes = action.encode();
+            let receipt = self.send_call_for_receipt(&abi::encode_submit_turn(&action_bytes))?;
 
-            // Replay battle locally using event data
-            let battle_report = if let Some((battle_seed, ghost_units)) = battle_event {
-                let enemy_units: Vec<CombatUnit> = ghost_units
+            let battle_event = parse_battle_reported(&receipt)?;
+
+            let battle_report = if let Some(event) = battle_event {
+                let enemy_units: Vec<CombatUnit> = event
+                    .ghost
                     .iter()
-                    .filter_map(|(card_id, perm_attack, perm_health)| {
-                        let card = self.card_pool.get(&CardId(*card_id))?;
+                    .filter_map(|gu| {
+                        let card = self.card_pool.get(&gu.card_id)?;
                         let mut cu = CombatUnit::from_card(card.clone());
-                        cu.attack_buff = *perm_attack;
-                        cu.health_buff = *perm_health;
-                        cu.health = cu.health.saturating_add(*perm_health).max(0);
+                        cu.attack_buff = gu.perm_attack;
+                        cu.health_buff = gu.perm_health;
+                        cu.health = cu.health.saturating_add(gu.perm_health).max(0);
                         Some(cu)
                     })
                     .collect();
                 let enemy_count = enemy_units.len();
 
-                let mut rng = XorShiftRng::seed_from_u64(battle_seed);
-                let board_size = state.config.board_size as usize;
-                let events = resolve_battle(player_units, enemy_units, &mut rng, &self.card_pool, board_size);
+                let mut rng = XorShiftRng::seed_from_u64(event.battle_seed);
+                let events = resolve_battle(
+                    player_units,
+                    enemy_units,
+                    &mut rng,
+                    &self.card_pool,
+                    board_size,
+                );
 
                 BattleReport {
-                    player_units_survived: 0, // Will be updated from chain state
+                    player_units_survived: 0,
                     enemy_units_faced: enemy_count,
                     events,
                 }
@@ -270,7 +220,6 @@ mod inner {
                 }
             };
 
-            // Sync state from chain
             self.sync_state_from_chain()?;
 
             let state = self
@@ -295,13 +244,7 @@ mod inner {
                 };
 
                 eprintln!("Game over ({}). Submitting end_game...", result);
-                let _ = self.rt.block_on(submit_extrinsic(
-                    &self.api,
-                    &self.keypair,
-                    "OabArena",
-                    "end_game",
-                    vec![],
-                ));
+                let _ = self.send_call(&abi::encode_end_game());
 
                 Some(result.to_string())
             } else {
@@ -377,16 +320,20 @@ mod inner {
         }
 
         #[allow(dead_code)]
-        pub fn get_sets(&self) -> Vec<crate::types::SetInfo> {
-            self.sets
-                .iter()
-                .map(|(id, entries)| crate::types::SetInfo {
-                    id: *id as u32,
-                    name: format!("Set #{}", id),
-                    card_count: entries.len(),
-                    cards: entries
+        pub fn get_sets(&self) -> Vec<SetInfo> {
+            let metas = oab_assets::sets::get_all_metas();
+            let all_sets = oab_assets::sets::get_all();
+            metas
+                .into_iter()
+                .zip(all_sets.into_iter())
+                .map(|(meta, set)| SetInfo {
+                    id: meta.id,
+                    name: meta.name.to_string(),
+                    card_count: set.cards.len(),
+                    cards: set
+                        .cards
                         .iter()
-                        .map(|e| crate::types::SetCardEntry {
+                        .map(|e| SetCardEntry {
                             card_id: e.card_id.0,
                             rarity: e.rarity,
                         })
@@ -394,437 +341,399 @@ mod inner {
                 })
                 .collect()
         }
-    }
 
-    // ── Blockchain helpers ──
+        // ── Private helpers ──────────────────────────────────────────────
 
-    fn parse_suri(suri: &str) -> Result<Keypair, String> {
-        use subxt_signer::sr25519::dev;
-        match suri {
-            "//Alice" | "//alice" => Ok(dev::alice()),
-            "//Bob" | "//bob" => Ok(dev::bob()),
-            "//Charlie" | "//charlie" => Ok(dev::charlie()),
-            "//Dave" | "//dave" => Ok(dev::dave()),
-            "//Eve" | "//eve" => Ok(dev::eve()),
-            "//Ferdie" | "//ferdie" => Ok(dev::ferdie()),
-            _ => {
-                let secret_uri: subxt_signer::SecretUri =
-                    suri.parse().map_err(|e| format!("Invalid SURI: {:?}", e))?;
-                Keypair::from_uri(&secret_uri)
-                    .map_err(|e| format!("Failed to derive keypair: {:?}", e))
-            }
-        }
-    }
-
-    /// Submit submit_turn and extract battle_seed + opponent_board from BattleReported event.
-    /// Returns (battle_seed, Vec<(card_id, perm_attack, perm_health)>).
-    async fn submit_turn_and_get_battle_event(
-        api: &OnlineClient<SubstrateConfig>,
-        keypair: &Keypair,
-        action_value: Value,
-    ) -> Result<Option<(u64, Vec<(u16, StatValue, StatValue)>)>, String> {
-        let tx = subxt::dynamic::tx("OabArena", "submit_turn", vec![("action", action_value)]);
-
-        let mut progress = api
-            .tx()
-            .sign_and_submit_then_watch_default(&tx, keypair)
-            .await
-            .map_err(|e| format!("Tx submission failed: {}", e))?;
-
-        use subxt::tx::TxStatus;
-        while let Some(status) = progress.next().await {
-            match status.map_err(|e| format!("Tx status error: {}", e))? {
-                TxStatus::InBestBlock(block) | TxStatus::InFinalizedBlock(block) => {
-                    let events = block
-                        .wait_for_success()
-                        .await
-                        .map_err(|e| format!("Tx failed: {}", e))?;
-
-                    // Find BattleReported event
-                    for event in events.iter() {
-                        let event = event.map_err(|e| format!("Event decode error: {}", e))?;
-                        if event.pallet_name() == "OabArena"
-                            && event.variant_name() == "BattleReported"
-                        {
-                            let bytes = event.field_bytes();
-                            if let Ok(parsed) = decode_battle_reported_event(bytes) {
-                                return Ok(Some(parsed));
-                            }
-                        }
-                    }
-
-                    // Event not found — still success, just no replay data
-                    return Ok(None);
-                }
-                TxStatus::Error { message } => return Err(format!("Tx error: {}", message)),
-                TxStatus::Dropped { message } => return Err(format!("Tx dropped: {}", message)),
-                TxStatus::Invalid { message } => return Err(format!("Tx invalid: {}", message)),
-                _ => {}
-            }
-        }
-
-        Err("Tx stream ended without inclusion".into())
-    }
-
-    async fn submit_extrinsic(
-        api: &OnlineClient<SubstrateConfig>,
-        keypair: &Keypair,
-        pallet: &str,
-        call: &str,
-        args: Vec<(&str, Value)>,
-    ) -> Result<(), String> {
-        let tx = subxt::dynamic::tx(pallet, call, args);
-
-        let mut progress = api
-            .tx()
-            .sign_and_submit_then_watch_default(&tx, keypair)
-            .await
-            .map_err(|e| format!("Tx submission failed: {}", e))?;
-
-        use subxt::tx::TxStatus;
-        while let Some(status) = progress.next().await {
-            match status.map_err(|e| format!("Tx status error: {}", e))? {
-                TxStatus::InBestBlock(block) => {
-                    block
-                        .wait_for_success()
-                        .await
-                        .map_err(|e| format!("Tx failed: {}", e))?;
+        fn sync_state_from_chain(&mut self) -> Result<(), String> {
+            let raw = self.eth_call(&abi::encode_get_game_state())?;
+            let bytes = match abi::decode_dynamic_bytes(&raw) {
+                Some(b) if !b.is_empty() && !is_missing_session(&b) => b,
+                _ => {
+                    self.state = None;
                     return Ok(());
                 }
-                TxStatus::InFinalizedBlock(block) => {
-                    block
-                        .wait_for_success()
-                        .await
-                        .map_err(|e| format!("Tx failed: {}", e))?;
-                    return Ok(());
-                }
-                TxStatus::Error { message } => return Err(format!("Tx error: {}", message)),
-                TxStatus::Dropped { message } => return Err(format!("Tx dropped: {}", message)),
-                TxStatus::Invalid { message } => return Err(format!("Tx invalid: {}", message)),
-                _ => {}
-            }
-        }
+            };
 
-        Err("Tx stream ended without inclusion".into())
-    }
+            let session = ContractSession::decode(&mut &bytes[..])
+                .map_err(|e| format!("Failed to decode ArenaSession: {}", e))?;
 
-    async fn fetch_raw_storage(
-        api: &OnlineClient<SubstrateConfig>,
-        pallet: &str,
-        entry: &str,
-        keys: Vec<Value>,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let address = subxt::dynamic::storage(pallet, entry, keys);
-        let key_bytes =
-            subxt::ext::subxt_core::storage::get_address_bytes(&address, &api.metadata())
-                .map_err(|e| format!("Storage key error: {}", e))?;
-        let storage = api
-            .storage()
-            .at_latest()
-            .await
-            .map_err(|e| format!("Storage error: {}", e))?;
-        let result: Option<Vec<u8>> = storage
-            .fetch_raw(key_bytes)
-            .await
-            .map_err(|e| format!("Fetch error: {}", e))?;
-        Ok(result)
-    }
+            let local = LocalGameState {
+                bag: session.bag,
+                hand: session.hand,
+                board: session.board,
+                mana_limit: session.mana_limit,
+                shop_mana: session.shop_mana,
+                round: session.round,
+                lives: session.lives,
+                wins: session.wins,
+                phase: session.phase,
+                next_card_id: session.next_card_id,
+                game_seed: session.game_seed,
+            };
 
-    async fn load_active_game(
-        api: &OnlineClient<SubstrateConfig>,
-        account_id: &subxt::utils::AccountId32,
-    ) -> Result<Option<GameSession>, String> {
-        let raw = fetch_raw_storage(
-            api,
-            "OabArena",
-            "ActiveGame",
-            vec![Value::from_bytes(account_id.0)],
-        )
-        .await?;
-
-        match raw {
-            Some(bytes) => {
-                let mut input = &bytes[..];
-                let bounded = oab_game::bounded::BoundedGameSession::<
-                    MaxBagSize,
-                    MaxBoardSize,
-                    MaxHandActions,
-                >::decode(&mut input)
-                .map_err(|e| format!("Failed to decode game session: {:?}", e))?;
-                Ok(Some(bounded.into()))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn load_card_pool_from_chain(
-        api: &OnlineClient<SubstrateConfig>,
-    ) -> Result<BTreeMap<CardId, UnitCard>, String> {
-        let mut card_pool = BTreeMap::new();
-
-        let storage = api
-            .storage()
-            .at_latest()
-            .await
-            .map_err(|e| format!("Storage error: {}", e))?;
-        let address = subxt::dynamic::storage("OabCardRegistry", "UserCards", ());
-        let mut iter = storage
-            .iter(address)
-            .await
-            .map_err(|e| format!("Iter error: {}", e))?;
-
-        while let Some(Ok(kv)) = iter.next().await {
-            if let Ok(card_data) = decode_user_card_data(kv.value.encoded()) {
-                let card_id = extract_card_id_from_key(&kv.key_bytes);
-                card_pool.insert(
-                    CardId(card_id),
-                    UnitCard {
-                        id: CardId(card_id),
-                        name: String::new(),
-                        stats: card_data.0,
-                        economy: card_data.1,
-                        shop_abilities: card_data.2,
-                        battle_abilities: card_data.3,
-                    },
-                );
-            }
-        }
-
-        // Load card names
-        let meta_address = subxt::dynamic::storage("OabCardRegistry", "CardMetadataStore", ());
-        let mut meta_iter = storage
-            .iter(meta_address)
-            .await
-            .map_err(|e| format!("Meta iter error: {}", e))?;
-
-        while let Some(Ok(kv)) = meta_iter.next().await {
-            let card_id = extract_card_id_from_key(&kv.key_bytes);
-            if let Some(card) = card_pool.get_mut(&CardId(card_id)) {
-                if let Ok(name) = decode_card_name(kv.value.encoded()) {
-                    card.name = name;
-                }
-            }
-        }
-
-        Ok(card_pool)
-    }
-
-    // ── Value encoding helpers ──
-
-    /// Convert a CommitTurnAction to a subxt dynamic Value matching the pallet's type.
-    fn commit_turn_action_to_value(action: &CommitTurnAction) -> Value {
-        let actions: Vec<Value> = action
-            .actions
-            .iter()
-            .map(|a| match a {
-                TurnAction::BurnFromHand { hand_index } => Value::named_variant(
-                    "BurnFromHand",
-                    [("hand_index", Value::u128(*hand_index as u128))],
-                ),
-                TurnAction::PlayFromHand {
-                    hand_index,
-                    board_slot,
-                } => Value::named_variant(
-                    "PlayFromHand",
-                    [
-                        ("hand_index", Value::u128(*hand_index as u128)),
-                        ("board_slot", Value::u128(*board_slot as u128)),
-                    ],
-                ),
-                TurnAction::BurnFromBoard { board_slot } => Value::named_variant(
-                    "BurnFromBoard",
-                    [("board_slot", Value::u128(*board_slot as u128))],
-                ),
-                TurnAction::SwapBoard { slot_a, slot_b } => Value::named_variant(
-                    "SwapBoard",
-                    [
-                        ("slot_a", Value::u128(*slot_a as u128)),
-                        ("slot_b", Value::u128(*slot_b as u128)),
-                    ],
-                ),
-                TurnAction::MoveBoard { from_slot, to_slot } => Value::named_variant(
-                    "MoveBoard",
-                    [
-                        ("from_slot", Value::u128(*from_slot as u128)),
-                        ("to_slot", Value::u128(*to_slot as u128)),
-                    ],
-                ),
-            })
-            .collect();
-
-        Value::named_composite([("actions", Value::unnamed_composite(actions))])
-    }
-
-    async fn load_all_sets_from_chain(
-        api: &OnlineClient<SubstrateConfig>,
-    ) -> Result<Vec<(SetIdValue, Vec<CardSetEntry>)>, String> {
-        let mut sets = Vec::new();
-        let storage = api
-            .storage()
-            .at_latest()
-            .await
-            .map_err(|e| format!("Storage error: {}", e))?;
-        let address = subxt::dynamic::storage("OabCardRegistry", "CardSets", ());
-        let mut iter = storage
-            .iter(address)
-            .await
-            .map_err(|e| format!("Iter error: {}", e))?;
-
-        while let Some(Ok(kv)) = iter.next().await {
-            let set_id = extract_card_id_from_key(&kv.key_bytes); // same key format as cards
-            if let Ok(entries) = Vec::<CardSetEntry>::decode(&mut kv.value.encoded()) {
-                sets.push((set_id, entries));
-            }
-        }
-
-        Ok(sets)
-    }
-
-    // ── Event decoding ──
-
-    /// Decode BattleReported event fields.
-    /// Event layout: owner (AccountId32), round (i32), result (BattleResult enum),
-    ///               new_seed (u64), battle_seed (u64), opponent_board (BoundedGhostBoard)
-    /// Returns (battle_seed, Vec<(card_id, perm_attack, perm_health)>)
-    fn decode_battle_reported_event(
-        bytes: &[u8],
-    ) -> Result<(u64, Vec<(u16, StatValue, StatValue)>), parity_scale_codec::Error> {
-        let mut input = bytes;
-        // owner: AccountId32 (32 bytes)
-        let _owner = <[u8; 32]>::decode(&mut input)?;
-        // round: RoundValue (u8)
-        let _round = RoundValue::decode(&mut input)?;
-        // result: BattleResult (enum, 1 byte index)
-        let _result = u8::decode(&mut input)?;
-        // new_seed: u64
-        let _new_seed = u64::decode(&mut input)?;
-        // battle_seed: u64
-        let battle_seed = u64::decode(&mut input)?;
-        // opponent_board: BoundedGhostBoard = { units: BoundedVec<GhostBoardUnit> }
-        // BoundedVec encodes as Vec: length prefix + items
-        // GhostBoardUnit: { card_id: CardId(u16), perm_attack: StatValue(i16), perm_health: StatValue(i16) }
-        let unit_count = parity_scale_codec::Compact::<u32>::decode(&mut input)?.0 as usize;
-        let mut units = Vec::with_capacity(unit_count);
-        for _ in 0..unit_count {
-            let card_id = u16::decode(&mut input)?;
-            let perm_attack = StatValue::decode(&mut input)?;
-            let perm_health = StatValue::decode(&mut input)?;
-            units.push((card_id, perm_attack, perm_health));
-        }
-
-        Ok((battle_seed, units))
-    }
-
-    // ── SCALE decoding helpers ──
-
-    fn decode_user_card_data(
-        bytes: &[u8],
-    ) -> Result<(UnitStats, EconomyStats, Vec<ShopAbility>, Vec<Ability>), parity_scale_codec::Error>
-    {
-        let mut input = bytes;
-        let stats = UnitStats::decode(&mut input)?;
-        let economy = EconomyStats::decode(&mut input)?;
-        let shop_abilities = Vec::<ShopAbility>::decode(&mut input)?;
-        let battle_abilities = Vec::<Ability>::decode(&mut input)?;
-        Ok((stats, economy, shop_abilities, battle_abilities))
-    }
-
-    fn decode_card_name(bytes: &[u8]) -> Result<String, parity_scale_codec::Error> {
-        let mut input = bytes;
-        let _creator = <[u8; 32]>::decode(&mut input)?;
-        let name_bytes = Vec::<u8>::decode(&mut input)?;
-        Ok(String::from_utf8_lossy(&name_bytes).to_string())
-    }
-
-    fn extract_card_id_from_key(key_bytes: &[u8]) -> u16 {
-        if key_bytes.len() >= 2 {
-            let offset = key_bytes.len() - 2;
-            u16::from_le_bytes([key_bytes[offset], key_bytes[offset + 1]])
-        } else {
-            0
-        }
-    }
-
-    /// Fund a list of accounts in a single batch transfer from the funder.
-    pub fn fund_accounts(
-        url: &str,
-        funder_suri: &str,
-        target_suris: &[String],
-    ) -> Result<(), String> {
-        let rt = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
-
-        let api = rt
-            .block_on(OnlineClient::<SubstrateConfig>::from_url(url))
-            .map_err(|e| format!("Failed to connect to {}: {}", url, e))?;
-
-        let funder = parse_suri(funder_suri)?;
-        let amount: u128 = 1u128 << 50;
-
-        // Build batch of transfer calls
-        let mut calls: Vec<Value> = Vec::new();
-        for suri in target_suris {
-            let target_keypair = parse_suri(suri)?;
-            let target_account: subxt::utils::AccountId32 = target_keypair.public_key().into();
-            eprintln!("  {} -> {}", suri, target_account);
-
-            calls.push(Value::unnamed_variant(
-                "Balances",
-                [Value::unnamed_variant(
-                    "transfer_allow_death",
-                    [
-                        Value::unnamed_variant("Id", [Value::from_bytes(target_account.0)]),
-                        Value::u128(amount),
-                    ],
-                )],
+            self.state = Some(GameState::reconstruct(
+                self.card_pool.clone(),
+                session.set_id,
+                sealed::default_config(),
+                local,
             ));
+            Ok(())
         }
 
-        let batch_tx = subxt::dynamic::tx(
-            "Utility",
-            "batch_all",
-            vec![("calls", Value::unnamed_composite(calls))],
-        );
+        fn eth_call(&self, data: &str) -> Result<String, String> {
+            rpc::eth_call(
+                &self.rpc_url,
+                &self.from_address,
+                &self.contract_address,
+                data,
+            )
+        }
 
-        rt.block_on(async {
-            let mut progress = api
-                .tx()
-                .sign_and_submit_then_watch_default(&batch_tx, &funder)
-                .await
-                .map_err(|e| format!("Batch fund tx failed: {}", e))?;
+        /// Send a state-changing call and wait for the receipt's success.
+        fn send_call(&self, data: &str) -> Result<rpc::Receipt, String> {
+            rpc::eth_send_transaction(
+                &self.rpc_url,
+                &self.from_address,
+                &self.contract_address,
+                data,
+            )
+        }
 
-            use subxt::tx::TxStatus;
-            while let Some(status) = progress.next().await {
-                match status.map_err(|e| format!("Tx status error: {}", e))? {
-                    TxStatus::InBestBlock(block) | TxStatus::InFinalizedBlock(block) => {
-                        block
-                            .wait_for_success()
-                            .await
-                            .map_err(|e| format!("Batch fund tx failed: {}", e))?;
-                        return Ok(());
-                    }
-                    TxStatus::Error { message } => return Err(format!("Batch error: {}", message)),
-                    TxStatus::Dropped { message } => {
-                        return Err(format!("Batch dropped: {}", message))
-                    }
-                    TxStatus::Invalid { message } => {
-                        return Err(format!("Batch invalid: {}", message))
-                    }
-                    _ => {}
-                }
+        fn send_call_for_receipt(&self, data: &str) -> Result<rpc::Receipt, String> {
+            self.send_call(data)
+        }
+    }
+
+    // ── ArenaSession mirror (matches contract field order) ──────────────
+
+    #[derive(Debug, Decode)]
+    struct ContractSession {
+        bag: Vec<CardId>,
+        hand: Vec<CardId>,
+        board: Vec<Option<BoardUnit>>,
+        mana_limit: ManaValue,
+        shop_mana: ManaValue,
+        round: RoundValue,
+        lives: RoundValue,
+        wins: RoundValue,
+        phase: GamePhase,
+        next_card_id: u16,
+        game_seed: u64,
+        set_id: SetIdValue,
+    }
+
+    /// revive's `Mapping` getter materializes a zeroed value for missing keys
+    /// instead of returning empty bytes. Treat all-zero payloads as "no game".
+    fn is_missing_session(data: &[u8]) -> bool {
+        data.iter().all(|b| *b == 0)
+    }
+
+    // ── BattleReported event parsing ─────────────────────────────────────
+
+    struct BattleReportedEvent {
+        battle_seed: u64,
+        ghost: Vec<GhostBoardUnit>,
+    }
+
+    fn parse_battle_reported(
+        receipt: &rpc::Receipt,
+    ) -> Result<Option<BattleReportedEvent>, String> {
+        for log in &receipt.logs {
+            let topic_match = log
+                .topics
+                .first()
+                .map(|t| t.eq_ignore_ascii_case(BATTLE_REPORTED_TOPIC))
+                .unwrap_or(false);
+            if !topic_match {
+                continue;
             }
-            Err("Batch tx ended without inclusion".into())
-        })?;
 
-        eprintln!(
-            "  All {} accounts funded in one transaction.",
-            target_suris.len()
-        );
-        Ok(())
+            let bytes = abi::hex_to_bytes(&log.data)?;
+            if bytes.len() < 12 {
+                return Err(format!(
+                    "BattleReported event truncated: got {} bytes, expected >= 12",
+                    bytes.len()
+                ));
+            }
+
+            let battle_seed = u64::from_be_bytes(
+                bytes[4..12]
+                    .try_into()
+                    .map_err(|_| "Failed to slice battleSeed bytes".to_string())?,
+            );
+            let ghost_bytes = &bytes[12..];
+            let ghost = if ghost_bytes.is_empty() {
+                Vec::new()
+            } else {
+                Vec::<GhostBoardUnit>::decode(&mut &ghost_bytes[..])
+                    .map_err(|e| format!("Failed to decode ghost SCALE: {}", e))?
+            };
+
+            return Ok(Some(BattleReportedEvent { battle_seed, ghost }));
+        }
+        Ok(None)
+    }
+
+    // ── Deployment helpers ───────────────────────────────────────────────
+
+    #[derive(Debug, Deserialize)]
+    struct Deployment {
+        address: String,
+    }
+
+    fn find_deployment_address() -> Result<String, String> {
+        // Prefer the submodule path first.
+        let candidates = [
+            "deps/open-auto-battler/contract/deployment.json",
+            "../open-auto-battler/contract/deployment.json",
+        ];
+        for rel in &candidates {
+            let path = PathBuf::from(rel);
+            if path.exists() {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Failed to read {}: {}", rel, e))?;
+                let dep: Deployment = serde_json::from_str(&text)
+                    .map_err(|e| format!("Failed to parse {}: {}", rel, e))?;
+                return Ok(dep.address);
+            }
+        }
+        Err(
+            "Contract address not specified and deployment.json not found. \
+             Pass --contract or run open-auto-battler's deploy script first."
+                .into(),
+        )
+    }
+
+    // ── ABI helpers ──────────────────────────────────────────────────────
+
+    pub mod abi {
+        use super::*;
+
+        fn keccak256_bytes(data: &[u8]) -> [u8; 32] {
+            let mut hasher = Keccak::v256();
+            hasher.update(data);
+            let mut out = [0u8; 32];
+            hasher.finalize(&mut out);
+            out
+        }
+
+        fn selector(signature: &str) -> String {
+            let hash = keccak256_bytes(signature.as_bytes());
+            hash[..4].iter().map(|b| format!("{:02x}", b)).collect()
+        }
+
+        fn pad_uint(value: u64) -> String {
+            format!("{:064x}", value)
+        }
+
+        /// Encode a `bytes` parameter (length + data, padded to 32 bytes).
+        fn pad_bytes(data: &[u8]) -> String {
+            let len = pad_uint(data.len() as u64);
+            let body: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+            let padded = ((body.len() + 63) / 64) * 64;
+            format!("{}{:0<width$}", len, body, width = padded)
+        }
+
+        pub fn encode_start_game(set_id: SetIdValue, seed_nonce: u64) -> String {
+            format!(
+                "0x{}{}{}",
+                selector("startGame(uint16,uint64)"),
+                pad_uint(set_id as u64),
+                pad_uint(seed_nonce)
+            )
+        }
+
+        pub fn encode_submit_turn(action_scale: &[u8]) -> String {
+            // Single dynamic `bytes` arg → offset is 0x20.
+            format!(
+                "0x{}{}{}",
+                selector("submitTurn(bytes)"),
+                pad_uint(0x20),
+                pad_bytes(action_scale)
+            )
+        }
+
+        pub fn encode_get_game_state() -> String {
+            format!("0x{}", selector("getGameState()"))
+        }
+
+        pub fn encode_end_game() -> String {
+            format!("0x{}", selector("endGame()"))
+        }
+
+        pub fn encode_abandon_game() -> String {
+            format!("0x{}", selector("abandonGame()"))
+        }
+
+        /// Decode a Solidity `bytes` return value: 32-byte offset, 32-byte
+        /// length, then the raw bytes (32-byte aligned).
+        pub fn decode_dynamic_bytes(hex_data: &str) -> Option<Vec<u8>> {
+            let raw = hex_data.strip_prefix("0x").unwrap_or(hex_data);
+            if raw.is_empty() {
+                return None;
+            }
+            // Need at least offset (64 hex) + length (64 hex) = 128 hex chars.
+            if raw.len() < 128 {
+                return None;
+            }
+            // Length is the second 32-byte word.
+            let len_hex = &raw[64..128];
+            let len = u64::from_str_radix(len_hex, 16).ok()? as usize;
+            if len == 0 {
+                return Some(Vec::new());
+            }
+            let body_start: usize = 128;
+            let body_end = body_start.checked_add(len.checked_mul(2)?)?;
+            if raw.len() < body_end {
+                return None;
+            }
+            let body_hex = &raw[body_start..body_end];
+            hex_to_bytes(&format!("0x{}", body_hex)).ok()
+        }
+
+        pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+            let raw = hex.strip_prefix("0x").unwrap_or(hex);
+            if raw.len() % 2 != 0 {
+                return Err(format!("Odd hex length: {}", raw.len()));
+            }
+            (0..raw.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&raw[i..i + 2], 16)
+                        .map_err(|e| format!("Invalid hex byte at {}: {}", i, e))
+                })
+                .collect()
+        }
+    }
+
+    // ── JSON-RPC helpers ─────────────────────────────────────────────────
+
+    pub mod rpc {
+        use super::*;
+
+        #[derive(Debug)]
+        pub struct LogEntry {
+            pub topics: Vec<String>,
+            pub data: String,
+        }
+
+        #[derive(Debug)]
+        pub struct Receipt {
+            pub logs: Vec<LogEntry>,
+        }
+
+        fn post(url: &str, body: &Value) -> Result<Value, String> {
+            let resp = ureq::post(url)
+                .set("Content-Type", "application/json")
+                .send_json(body)
+                .map_err(|e| format!("HTTP error to {}: {}", url, e))?;
+            let json: Value = resp
+                .into_json()
+                .map_err(|e| format!("Failed to decode JSON from {}: {}", url, e))?;
+            if let Some(err) = json.get("error") {
+                return Err(format!("RPC error: {}", err));
+            }
+            Ok(json)
+        }
+
+        pub fn eth_chain_id(url: &str) -> Result<u64, String> {
+            let body = json!({"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1});
+            let resp = post(url, &body)?;
+            let result = resp["result"].as_str().ok_or("Missing chainId result")?;
+            u64::from_str_radix(result.strip_prefix("0x").unwrap_or(result), 16)
+                .map_err(|e| format!("Invalid chainId: {}", e))
+        }
+
+        pub fn first_dev_account(url: &str) -> Result<String, String> {
+            let body = json!({"jsonrpc":"2.0","method":"eth_accounts","params":[],"id":1});
+            let resp = post(url, &body)?;
+            resp["result"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    "No dev accounts available. Pass --from or unlock an account on the node."
+                        .to_string()
+                })
+        }
+
+        pub fn eth_call(url: &str, from: &str, to: &str, data: &str) -> Result<String, String> {
+            let body = json!({
+                "jsonrpc":"2.0","method":"eth_call",
+                "params":[{"from":from,"to":to,"data":data},"latest"],
+                "id":1
+            });
+            let resp = post(url, &body)?;
+            Ok(resp["result"].as_str().unwrap_or("0x").to_string())
+        }
+
+        pub fn eth_send_transaction(
+            url: &str,
+            from: &str,
+            to: &str,
+            data: &str,
+        ) -> Result<Receipt, String> {
+            let body = json!({
+                "jsonrpc":"2.0","method":"eth_sendTransaction",
+                "params":[{"from":from,"to":to,"data":data,"gas":"0x10000000"}],
+                "id":1
+            });
+            let resp = post(url, &body)?;
+            let tx_hash = resp["result"]
+                .as_str()
+                .ok_or("Missing tx hash")?
+                .to_string();
+            wait_for_receipt(url, &tx_hash)
+        }
+
+        fn wait_for_receipt(url: &str, tx_hash: &str) -> Result<Receipt, String> {
+            for _ in 0..120 {
+                let body = json!({
+                    "jsonrpc":"2.0","method":"eth_getTransactionReceipt",
+                    "params":[tx_hash], "id":1
+                });
+                let resp = post(url, &body)?;
+                if let Some(result) = resp.get("result").filter(|v| !v.is_null()) {
+                    let status = result
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0");
+                    let logs = result
+                        .get("logs")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|log| LogEntry {
+                                    topics: log
+                                        .get("topics")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
+                                    data: log
+                                        .get("data")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("0x")
+                                        .to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if status != "0x1" {
+                        return Err(format!("Transaction reverted: {}", tx_hash));
+                    }
+                    return Ok(Receipt { logs });
+                }
+                sleep(Duration::from_millis(250));
+            }
+            Err(format!("Timed out waiting for receipt: {}", tx_hash))
+        }
     }
 }
 
 #[cfg(feature = "chain")]
 pub use inner::ChainGameSession;
-
-#[cfg(feature = "chain")]
-pub use inner::fund_accounts;
